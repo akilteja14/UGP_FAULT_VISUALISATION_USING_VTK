@@ -1,0 +1,4 @@
+Data/Outputs/faults_seismic_data.segy
+Data/Uploads/seismic_data.segy
+Data/Uploads/uploaded_seismic_data.segy
+model/pretrained_model.hdf5
