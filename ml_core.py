@@ -9,13 +9,22 @@ OVERLAP = 12
 
 def load_model():
     print("Loading trained model...")
-    with open('model/model3.json', 'r') as f:
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    model_json_path = os.path.join(base_dir, 'model', 'model3.json')
+    weights_path = os.path.join(base_dir, 'model', 'pretrained_model.hdf5')
+
+    if not os.path.exists(model_json_path):
+        raise FileNotFoundError(f"Model JSON not found at {model_json_path}. Ensure 'model/model3.json' exists.")
+    if not os.path.exists(weights_path):
+        raise FileNotFoundError(f"Weights file not found at {weights_path}. Place your weights at 'model/pretrained_model.hdf5' or update the path.")
+
+    with open(model_json_path, 'r') as f:
         model_json = f.read()
 
     with tf.keras.utils.custom_object_scope({'Model': Model}):
         model = model_from_json(model_json)
-    
-    model.load_weights("model/pretrained_model.hdf5")
+
+    model.load_weights(weights_path)
     model.trainable = False
     return model
 
@@ -88,11 +97,30 @@ def process_segy(input_path, output_path, model):
 
         p1, p2, p3 = [(n-overlap)*c + overlap for c in [c1, c2, c3]]
         print(f"[ML] Padded shape: {p1} x {p2} x {p3}")
-        padded = np.zeros((p1, p2, p3), dtype=np.float32)
-        padded[:m1, :m2, :m3] = volume
 
-        output = np.zeros_like(padded)
-        weight = np.zeros_like(padded)
+        # Use disk-backed memmaps to avoid large RAM spikes
+        import tempfile, uuid
+        tmpdir = tempfile.gettempdir()
+        uid = uuid.uuid4().hex
+        padded_path = os.path.join(tmpdir, f"padded_{uid}.dat")
+        output_path_tmp = os.path.join(tmpdir, f"output_{uid}.dat")
+        weight_path_tmp = os.path.join(tmpdir, f"weight_{uid}.dat")
+
+        try:
+            padded = np.memmap(padded_path, dtype=np.float32, mode='w+', shape=(p1, p2, p3))
+            # copy volume into padded region
+            padded[:m1, :m2, :m3] = volume
+            output = np.memmap(output_path_tmp, dtype=np.float32, mode='w+', shape=(p1, p2, p3))
+            output[:] = 0.0
+            weight = np.memmap(weight_path_tmp, dtype=np.float32, mode='w+', shape=(p1, p2, p3))
+            weight[:] = 0.0
+        except Exception as e:
+            # Fall back to in-memory arrays if memmap creation fails
+            print(f"[ML] Memmap allocation failed: {e}; falling back to in-memory arrays")
+            padded = np.zeros((p1, p2, p3), dtype=np.float32)
+            padded[:m1, :m2, :m3] = volume
+            output = np.zeros_like(padded)
+            weight = np.zeros_like(padded)
         
         print("[ML] Creating overlap mask...")
         mask = create_overlap_mask()
@@ -117,9 +145,21 @@ def process_segy(input_path, output_path, model):
                         print(f"[ML] Progress: {patch_count}/{total_patches} ({progress}%)")
 
         print("[ML] Patch processing complete, finalizing result...")
-        result = (output / (weight + 1e-8))[:m1, :m2, :m3]
-        print(f"[ML] Result shape: {result.shape}")
-        print(f"[ML] Result data range: {result.min():.2f} - {result.max():.2f}")
+
+        # Compute result in chunks to avoid allocating the full array in RAM
+        eps = 1e-8
+        def iter_result_slices():
+            # iterate over the first axis (inlines) to produce (m2, m3) slices
+            for i in range(m1):
+                out_slice = output[i, :m2, :m3]
+                w_slice = weight[i, :m2, :m3]
+                with np.errstate(divide='ignore', invalid='ignore'):
+                    res_slice = out_slice / (w_slice + eps)
+                yield res_slice
+
+        # Determine flat trace count and prepare to write incrementally
+        flat_trace_count = m1 * m2
+        print(f"[ML] Preparing to write {flat_trace_count} traces incrementally...")
 
         # Ensure output directory exists
         output_dir = os.path.dirname(output_path)
@@ -132,25 +172,40 @@ def process_segy(input_path, output_path, model):
             spec = segyio.spec()
             spec.samples = src.samples
             spec.format = src.format
-            
-            # Calculate total number of traces
-            flat_result = result.reshape(-1, result.shape[-1])
-            spec.tracecount = len(flat_result)
+
+            # Write traces incrementally to avoid building the full result in RAM
+            spec.tracecount = m1 * m2
             print(f"[ML] Setting spec.tracecount to {spec.tracecount}")
-            
-            print("[ML] Creating SEGY file...")
+            print("[ML] Creating SEGY file (streaming writes)...")
             with segyio.create(output_path, spec) as dst:
-                # Write traces back in the same shape as input
-                dst.trace[:] = flat_result
-                print(f"[ML] Wrote {len(flat_result)} traces")
+                write_index = 0
+                for i, res_slice in enumerate(iter_result_slices()):
+                    # res_slice has shape (m2, m3)
+                    dst.trace[write_index:write_index + m2] = res_slice
+                    write_index += m2
+                    if i % max(1, m1 // 10) == 0:
+                        print(f"[ML] Written inline {i+1}/{m1}")
+                print(f"[ML] Wrote {write_index} traces")
 
         print(f"[ML] Successfully saved output to: {output_path}")
         if not os.path.exists(output_path):
             raise RuntimeError(f"Output file was not created at {output_path}")
-        
+
         file_size = os.path.getsize(output_path)
         print(f"[ML] Output file size: {file_size} bytes")
         print("[ML] Process completed successfully!")
+
+        # Clean up temporary memmap files if they exist
+        try:
+            for path in (padded_path, output_path_tmp, weight_path_tmp):
+                if 'path' in locals() and path and os.path.exists(path):
+                    try:
+                        os.remove(path)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
         return True
         
     except Exception as err:
