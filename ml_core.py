@@ -64,21 +64,124 @@ def process_segy(input_path, output_path, model):
                 print(f"[ML] Loaded as 3D cube: shape {volume.shape}")
             except (TypeError, ValueError) as e:
                 print(f"[ML] 3D cube load failed: {e}")
-                # DETECTIVE WORK: Find actual dimensions from headers 
+                # DETECTIVE WORK: Find actual dimensions from headers
                 print("[ML] Extracting dimensions from headers...")
-                inlines = f.attributes(segyio.TraceField.INLINE_3D)[:]
-                crosslines = f.attributes(segyio.TraceField.CROSSLINE_3D)[:]
-                
-                n_in = len(np.unique(inlines))
-                n_cr = len(np.unique(crosslines))
-                print(f"[ML] Detected grid: {n_in} inlines x {n_cr} crosslines")
-                
-                if n_in * n_cr == n_traces:
-                    print("[ML] Reshaping to 3D volume...")
-                    volume = f.trace.raw[:].reshape(n_in, n_cr, n_samples)
-                    print(f"[ML] Reshaped to: {volume.shape}")
-                else:
-                    raise ValueError(f"Geometry mismatch: {n_traces} traces vs {n_in}x{n_cr} grid.")
+
+                def _get_header_array(field):
+                    # Try segyio.attributes first (fast). If unavailable, iterate headers.
+                    try:
+                        arr = f.attributes(field)[:]
+                        if arr is not None and len(arr) == n_traces:
+                            return np.array(arr)
+                    except Exception:
+                        pass
+                    try:
+                        vals = []
+                        for i in range(n_traces):
+                            hdr = f.header[i]
+                            try:
+                                v = hdr[field]
+                            except Exception:
+                                # header may behave like a dict with .get
+                                try:
+                                    v = hdr.get(field, None)
+                                except Exception:
+                                    v = None
+                            vals.append(v)
+                        vals = np.array(vals)
+                        if len(vals) == n_traces:
+                            return vals
+                    except Exception:
+                        pass
+                    return None
+
+                inlines = _get_header_array(segyio.TraceField.INLINE_3D)
+                crosslines = _get_header_array(segyio.TraceField.CROSSLINE_3D)
+
+                def _try_fields_pair(a_field, b_field):
+                    a = _get_header_array(a_field)
+                    b = _get_header_array(b_field)
+                    if a is None or b is None:
+                        return None
+                    ua = np.unique(a)
+                    ub = np.unique(b)
+                    return (a, b, ua, ub) if (len(ua) * len(ub) == n_traces) else None
+
+                pair = _try_fields_pair(segyio.TraceField.INLINE_3D, segyio.TraceField.CROSSLINE_3D)
+
+                # If inline/crossline are degenerate, try other header field combinations
+                if pair is None:
+                    print("[ML] INLINE/CROSSLINE did not produce a full grid; searching other header pairs...")
+                    # Collect candidate trace fields from segyio.TraceField
+                    candidates = []
+                    for name in dir(segyio.TraceField):
+                        if name.startswith('_'):
+                            continue
+                        try:
+                            val = getattr(segyio.TraceField, name)
+                        except Exception:
+                            continue
+                        try:
+                            # include only integer-like fields
+                            int(val)
+                        except Exception:
+                            continue
+                        candidates.append(val)
+
+                    found = None
+                    # try pairs
+                    for i in range(len(candidates)):
+                        for j in range(i+1, len(candidates)):
+                            res = _try_fields_pair(candidates[i], candidates[j])
+                            if res is not None:
+                                found = (candidates[i], candidates[j], res)
+                                break
+                        if found:
+                            break
+
+                    if found:
+                        a_field, b_field, (a, b, ua, ub) = found
+                        print(f"[ML] Using header fields {a_field}, {b_field} to infer grid: {len(ua)} x {len(ub)}")
+                        inlines, crosslines, uniq_in, uniq_cr = a, b, ua, ub
+                        n_in, n_cr = len(uniq_in), len(uniq_cr)
+                    else:
+                        # Fallback: factor trace count into two factors close to sqrt(n_traces)
+                        print("[ML] Could not find matching header pair. Falling back to factor-based grid inference.")
+                        def _factors_close(n):
+                            root = int(np.floor(np.sqrt(n)))
+                            for x in range(root, 0, -1):
+                                if n % x == 0:
+                                    return x, n // x
+                            return 1, n
+                        n_in, n_cr = _factors_close(n_traces)
+                        print(f"[ML] Chosen grid (fallback): {n_in} x {n_cr} (product={n_in*n_cr})")
+                        if n_in * n_cr != n_traces:
+                            raise ValueError(f"Geometry mismatch remains: {n_traces} traces vs {n_in}x{n_cr} grid.")
+                        # Build volume directly from trace order (best-effort)
+                        print("[ML] Building volume from raw trace order (best-effort reshape)...")
+                        volume = f.trace.raw[:].reshape(n_in, n_cr, n_samples)
+                        print(f"[ML] Built fallback volume: {volume.shape}")
+
+                # If we have valid inline/crossline arrays, build volume using their mapping
+                if 'volume' not in locals():
+                    uniq_in = np.unique(inlines)
+                    uniq_cr = np.unique(crosslines)
+                    n_in, n_cr = len(uniq_in), len(uniq_cr)
+                    print(f"[ML] Detected grid: {n_in} inlines x {n_cr} crosslines")
+                    if n_in * n_cr == n_traces:
+                        print("[ML] Building 3D volume using header indices (robust ordering)...")
+                        in_map = {val: idx for idx, val in enumerate(uniq_in)}
+                        cr_map = {val: idx for idx, val in enumerate(uniq_cr)}
+                        volume = np.zeros((n_in, n_cr, n_samples), dtype=f.dtype)
+                        for t in range(n_traces):
+                            i_idx = in_map.get(inlines[t])
+                            j_idx = cr_map.get(crosslines[t])
+                            if i_idx is None or j_idx is None:
+                                raise ValueError(f"Trace {t} has headers outside detected grid: {inlines[t]}, {crosslines[t]}")
+                            volume[i_idx, j_idx, :] = f.trace.raw[t]
+                        print(f"[ML] Built volume: {volume.shape}")
+                    else:
+                        raise ValueError(f"Geometry mismatch after header analysis: {n_traces} traces vs {n_in}x{n_cr} grid.")
 
         volume = volume.astype(np.float32)
         m1, m2, m3 = volume.shape
