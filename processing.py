@@ -3,6 +3,7 @@ import numpy as np
 import vtk
 from vtk.util import numpy_support
 import base64
+import os
 
 # Note: Adjust this import to match wherever your actual ML logic lives
 from ml_core import load_model, process_segy
@@ -16,11 +17,17 @@ def get_model():
         _model_cache = load_model()
     return _model_cache
 
-def run_ml_extraction(input_path, output_path):
+def run_ml_extraction(input_path, output_path, progress_callback=None):
     """Wrapper to run the ML model."""
     model = get_model()
-    process_segy(input_path, output_path, model)
+    process_segy(input_path, output_path, model, progress_callback=progress_callback)
     return True
+
+
+def build_ml_output_path(input_path, output_dir):
+    """Create the default output SEG-Y path for an input file."""
+    filename = os.path.basename(input_path)
+    return os.path.join(output_dir, f"faults_{filename}")
 
 # --- Data Extraction ---
 def build_numpy_cube(filename):

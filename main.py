@@ -1,23 +1,33 @@
 import os
 import sys
+import threading
+import uuid
+import asyncio
+from urllib.parse import quote
+from aiohttp import web
 from trame.app import get_server
 from trame.ui.vuetify import SinglePageLayout
 from trame.widgets import vuetify, html
 
+processing = None
 try:
     import processing
 except ImportError as e:
     print(f"Warning: Could not import processing module: {e}")
 
 # --- Workspace Setup ---
-UPLOAD_DIR = 'data/uploads'
-OUTPUT_DIR = 'data/outputs'
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.abspath(os.path.join(BASE_DIR, ".."))
+UPLOAD_DIR = os.path.join(PROJECT_ROOT, "data", "uploads")
+OUTPUT_DIR = os.path.join(PROJECT_ROOT, "data", "outputs")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # --- Server ---
 server = get_server(client_type="vue2")
 state, ctrl = server.state, server.controller
+server.serve["outputs"] = OUTPUT_DIR
+server.serve["mltool"] = BASE_DIR
 
 # --- Backend ---
 class AppBackend:
@@ -28,14 +38,31 @@ class AppBackend:
 
 backend = AppBackend()
 
+ml_job_status = {
+    "stage": "idle",
+    "message": "Awaiting File...",
+    "percent": 0,
+    "running": False,
+    "completed_patches": 0,
+    "total_patches": 0,
+    "elapsed_seconds": 0,
+    "eta_seconds": 0,
+    "output_path": "",
+}
+
 # --- State ---
 state.active_tab = 0
 state.img_src = ""
 
 state.ml_processing = False
+state.ml_uploading = False
 state.ml_status_msg = "Awaiting File..."
 state.ml_result_ready = False
 state.ml_output_path = ""
+state.ml_input_path = ""
+state.ml_download_url = ""
+state.ml_selected_name = ""
+state.ml_ready_to_run = False
 
 state.viewer_processing = False
 state.viewer_status_msg = "Ready"
@@ -53,23 +80,190 @@ state.time_val = 0
 state.time_max = 100
 
 # --- Handlers ---
-def handle_ml_upload(file_path):
-    if not file_path:
+def handle_ml_upload(file_path=None):
+    input_path = (file_path or state.ml_input_path or "").strip()
+    if not input_path:
+        state.ml_status_msg = "Browse and upload a SEG-Y file first."
         return
-    state.ml_processing = True
-    state.ml_result_ready = False
-    state.ml_status_msg = "Processing file..."
-    
+
+    input_path = os.path.abspath(input_path)
+    if not os.path.exists(input_path):
+        state.ml_status_msg = f"File not found: {input_path}"
+        return
+
+    if processing is None:
+        state.ml_status_msg = "Processing module is unavailable."
+        return
+
+    def run_job():
+        with state:
+            state.ml_processing = True
+            state.ml_ready_to_run = False
+            state.ml_result_ready = False
+            state.ml_input_path = input_path
+            state.ml_output_path = ""
+            state.ml_download_url = ""
+            state.ml_status_msg = "Loading model and processing file..."
+
+        try:
+            output_path = processing.build_ml_output_path(input_path, OUTPUT_DIR)
+            processing.run_ml_extraction(input_path, output_path)
+            download_name = quote(os.path.basename(output_path))
+            with state:
+                state.ml_status_msg = "Process Finished. Success!"
+                state.ml_output_path = output_path
+                state.ml_download_url = f"/outputs/{download_name}"
+                state.ml_result_ready = True
+                state.ml_ready_to_run = True
+        except Exception as err:
+            with state:
+                state.ml_status_msg = f"Error: {str(err)}"
+                state.ml_ready_to_run = True
+        finally:
+            with state:
+                state.ml_processing = False
+
+    threading.Thread(target=run_job, daemon=True).start()
+
+
+def handle_upload_started(filename):
+    with state:
+        state.ml_uploading = True
+        state.ml_selected_name = filename or ""
+        state.ml_ready_to_run = False
+        state.ml_result_ready = False
+        state.ml_output_path = ""
+        state.ml_download_url = ""
+        state.ml_status_msg = f"Uploading: {state.ml_selected_name}" if state.ml_selected_name else "Uploading file..."
+
+
+def handle_uploaded_ml_file(file_path):
+    if not file_path:
+        state.ml_status_msg = "Upload failed. No file path returned."
+        return
+
+    with state:
+        state.ml_uploading = False
+        state.ml_input_path = file_path
+        state.ml_selected_name = os.path.basename(file_path)
+        state.ml_ready_to_run = True
+        state.ml_result_ready = False
+        state.ml_output_path = ""
+        state.ml_download_url = ""
+        state.ml_status_msg = f"Upload complete: {state.ml_selected_name}"
+
+
+def handle_upload_failed(message):
+    with state:
+        state.ml_uploading = False
+        state.ml_input_path = ""
+        state.ml_selected_name = ""
+        state.ml_ready_to_run = False
+        state.ml_status_msg = f"Upload failed: {message or 'Unknown error'}"
+
+
+async def upload_ml_file(request):
+    reader = await request.multipart()
+    field = await reader.next()
+
+    if field is None or field.name != "file":
+        return web.json_response({"error": "No file uploaded."}, status=400)
+
+    original_name = os.path.basename(field.filename or "upload.segy")
+    ext = os.path.splitext(original_name)[1].lower()
+    if ext not in [".segy", ".sgy"]:
+        return web.json_response({"error": "Only .segy and .sgy files are supported."}, status=400)
+
+    stem = os.path.splitext(original_name)[0]
+    saved_name = f"{stem}_{uuid.uuid4().hex[:8]}{ext}"
+    saved_path = os.path.join(UPLOAD_DIR, saved_name)
+
+    with open(saved_path, "wb") as output_file:
+        while True:
+            chunk = await field.read_chunk()
+            if not chunk:
+                break
+            output_file.write(chunk)
+
+    return web.json_response({"saved_path": saved_path, "filename": saved_name})
+
+
+async def ml_status(request):
+    return web.json_response(ml_job_status)
+
+
+def bind_server_routes(wslink_server):
+    wslink_server.app.router.add_post("/upload_ml", upload_ml_file)
+    wslink_server.app.router.add_post("/run_ml", run_ml_file)
+    wslink_server.app.router.add_get("/ml_status", ml_status)
+
+
+ctrl.on_server_bind.add(bind_server_routes)
+
+
+async def run_ml_file(request):
     try:
-        filename = os.path.basename(file_path)
-        output_path = os.path.join(OUTPUT_DIR, f"faults_{filename}")
-        state.ml_status_msg = "Process Finished. Success!"
-        state.ml_output_path = output_path
-        state.ml_result_ready = True
+        payload = await request.json()
+    except Exception:
+        return web.json_response({"error": "Invalid request payload."}, status=400)
+
+    input_path = os.path.abspath((payload.get("input_path") or "").strip())
+    if not input_path:
+        return web.json_response({"error": "Missing input file path."}, status=400)
+
+    if not os.path.exists(input_path):
+        return web.json_response({"error": "Uploaded file was not found on the server."}, status=404)
+
+    if processing is None:
+        return web.json_response({"error": "Processing module is unavailable."}, status=500)
+
+    output_path = processing.build_ml_output_path(input_path, OUTPUT_DIR)
+
+    ml_job_status.update(
+        {
+            "stage": "queued",
+            "message": "Queued for processing...",
+            "percent": 0,
+            "running": True,
+            "completed_patches": 0,
+            "total_patches": 0,
+            "elapsed_seconds": 0,
+            "eta_seconds": 0,
+            "output_path": "",
+        }
+    )
+
+    def progress_callback(update):
+        ml_job_status.update(update)
+        ml_job_status["running"] = update.get("stage") != "complete"
+
+    try:
+        await asyncio.to_thread(processing.run_ml_extraction, input_path, output_path, progress_callback)
     except Exception as err:
-        state.ml_status_msg = f"Error: {str(err)}"
-    finally:
-        state.ml_processing = False
+        ml_job_status.update(
+            {
+                "stage": "error",
+                "message": str(err),
+                "running": False,
+            }
+        )
+        return web.json_response({"error": str(err)}, status=500)
+
+    ml_job_status.update(
+        {
+            "stage": "complete",
+            "message": "Process Finished. Success!",
+            "percent": 100,
+            "running": False,
+            "output_path": output_path,
+        }
+    )
+    return web.json_response(
+        {
+            "output_path": output_path,
+            "download_url": f"/outputs/{quote(os.path.basename(output_path))}",
+        }
+    )
 
 def handle_viewer_upload(file_path):
     if not file_path:
@@ -195,6 +389,51 @@ with SinglePageLayout(server) as layout:
             transform: scale(1.01);
         }
 
+        .ml-panel {
+            border-radius: 16px;
+            background: linear-gradient(145deg, rgba(22, 27, 34, 0.9), rgba(16, 20, 26, 0.9));
+            border: 1px solid rgba(255, 255, 255, 0.06);
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+            backdrop-filter: blur(8px);
+            padding: 32px;
+        }
+
+        .ml-native-input {
+            width: 100%;
+            color: #e2e8f0;
+            background: rgba(255,255,255,0.03);
+            border: 1px solid rgba(255,255,255,0.12);
+            border-radius: 10px;
+            padding: 12px;
+        }
+
+        .ml-native-btn {
+            margin-top: 16px;
+            padding: 12px 20px;
+            border-radius: 999px;
+            border: none;
+            background: linear-gradient(90deg, #00d2ff 0%, #3a7bd5 100%);
+            color: white;
+            font-weight: 600;
+            cursor: pointer;
+        }
+
+        .ml-native-btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .ml-download-link {
+            display: inline-block;
+            margin-top: 16px;
+            padding: 12px 20px;
+            border-radius: 999px;
+            text-decoration: none;
+            background: linear-gradient(90deg, #00d2ff 0%, #3a7bd5 100%);
+            color: white;
+            font-weight: 600;
+        }
+
         /* 3D Viewer Area */
         .viewer-box {
             border-radius: 16px;
@@ -238,7 +477,118 @@ with SinglePageLayout(server) as layout:
         }
         .v-input__slider { margin-top: 0px; }
         """)
+        html.Script("""
+        window.__bindMlUploadUi = function() {
+            const input = document.getElementById('ml-upload-input');
+            const runBtn = document.getElementById('ml-run-btn');
+            const statusEl = document.getElementById('ml-status');
+            const selectedEl = document.getElementById('ml-selected-name');
+            const downloadWrap = document.getElementById('ml-download-wrap');
+            const downloadLink = document.getElementById('ml-download-link');
+            const outputEl = document.getElementById('ml-output-path');
 
+            if (!input || !runBtn || !statusEl || !selectedEl || !downloadWrap || !downloadLink || !outputEl) return;
+
+            window.mlUploadedPath = window.mlUploadedPath || '';
+
+            input.onchange = async function(event) {
+                const files = event.target && event.target.files ? event.target.files : null;
+                if (!files || !files.length) return;
+                const file = files[0];
+
+                selectedEl.textContent = file.name;
+                statusEl.textContent = `Uploading: ${file.name} (0%)`;
+                runBtn.disabled = true;
+                downloadWrap.style.display = 'none';
+                outputEl.textContent = '';
+
+                const formData = new FormData();
+                formData.append('file', file);
+
+                try {
+                    const payload = await new Promise((resolve, reject) => {
+                        const xhr = new XMLHttpRequest();
+                        xhr.open('POST', `${window.location.origin}/upload_ml`);
+                        xhr.responseType = 'json';
+
+                        xhr.upload.addEventListener('progress', function(progressEvent) {
+                            if (progressEvent.lengthComputable) {
+                                const percent = Math.round((progressEvent.loaded / progressEvent.total) * 100);
+                                statusEl.textContent = `Uploading: ${file.name} (${percent}%)`;
+                            } else {
+                                const uploadedMb = (progressEvent.loaded / (1024 * 1024)).toFixed(1);
+                                statusEl.textContent = `Uploading: ${file.name} (${uploadedMb} MB sent)`;
+                            }
+                        });
+
+                        xhr.addEventListener('load', function() {
+                            const payload = xhr.response || {};
+                            if (xhr.status < 200 || xhr.status >= 300) {
+                                reject(new Error(payload.error || `HTTP ${xhr.status}`));
+                                return;
+                            }
+                            resolve(payload);
+                        });
+
+                        xhr.addEventListener('error', function() {
+                            reject(new Error('Network error during upload'));
+                        });
+
+                        xhr.send(formData);
+                    });
+
+                    window.mlUploadedPath = payload.saved_path;
+                    statusEl.textContent = `Upload complete: ${payload.filename}`;
+                    runBtn.disabled = false;
+                } catch (error) {
+                    console.error(error);
+                    statusEl.textContent = `Upload failed: ${error && error.message ? error.message : 'Unknown error'}`;
+                    window.mlUploadedPath = '';
+                } finally {
+                    event.target.value = '';
+                }
+            };
+
+            runBtn.onclick = async function() {
+                if (!window.mlUploadedPath) {
+                    statusEl.textContent = 'Browse and upload a SEG-Y file first.';
+                    return;
+                }
+
+                runBtn.disabled = true;
+                downloadWrap.style.display = 'none';
+                outputEl.textContent = '';
+                statusEl.textContent = 'Running fault extraction...';
+
+                try {
+                    const response = await fetch(`${window.location.origin}/run_ml`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ input_path: window.mlUploadedPath })
+                    });
+                    const payload = await response.json();
+                    if (!response.ok) {
+                        statusEl.textContent = `Run failed: ${payload.error || 'Unknown error'}`;
+                        runBtn.disabled = false;
+                        return;
+                    }
+
+                    statusEl.textContent = 'Process Finished. Success!';
+                    outputEl.textContent = payload.output_path;
+                    downloadLink.href = payload.download_url;
+                    downloadWrap.style.display = 'block';
+                    runBtn.disabled = false;
+                } catch (error) {
+                    console.error(error);
+                    statusEl.textContent = `Run failed: ${error && error.message ? error.message : 'Unknown error'}`;
+                    runBtn.disabled = false;
+                }
+            };
+        };
+
+        window.__bindMlUploadUi();
+        setInterval(window.__bindMlUploadUi, 1000);
+        """)
         # Custom Toolbar Appended to Content
         with vuetify.VAppBar(app=True, flat=True, classes="glass-nav", dark=True):
             vuetify.VIcon("mdi-layers-triple", classes="mr-3", color="#00d2ff", size=28)
@@ -270,40 +620,11 @@ with SinglePageLayout(server) as layout:
                 # --- ML TAB ---
                 with vuetify.VTabItem():
                     with vuetify.VRow(justify="center", classes="mt-6"):
-                        with vuetify.VCol(cols="12", sm="10", md="7", lg="6"):
-                            with vuetify.VCard(classes="pa-8 card-modern", elevation=0, dark=True):
-
-                                html.Div("Deep Learning Fault Extraction", classes="section-title")
-                                html.P("Upload a SEGY file to pass through the neural network for automatic fault detection.", 
-                                       classes="text-body-2 grey--text text--lighten-1 mb-6")
-
-                                with html.Div(classes="upload-box text-center"):
-                                    vuetify.VIcon("mdi-cloud-upload-outline", size=48, color="#58a6ff", classes="mb-3")
-                                    vuetify.VFileInput(
-                                        label="Browse or drop SEGY file here",
-                                        accept=".segy,.sgy",
-                                        outlined=True,
-                                        dense=True,
-                                        hide_details=True,
-                                        color="#00d2ff",
-                                        prepend_icon="", 
-                                        dark=True
-                                    )
-
-                                with vuetify.VRow(v_if=("ml_processing",), justify="center", classes="mt-8 mb-4"):
-                                    with vuetify.VCol(classes="text-center"):
-                                        vuetify.VProgressCircular(indeterminate=True, color="#00d2ff", size=50, width=4)
-                                        html.Div("{{ ml_status_msg }}", classes="mt-3 text-subtitle-2 cyan--text")
-
-                                with vuetify.VRow(v_if=("ml_result_ready",), justify="center", classes="mt-8"):
-                                    vuetify.VBtn(
-                                        "Download Extracted Faults",
-                                        prepend_icon="mdi-download",
-                                        class_="glow-btn",
-                                        rounded=True,
-                                        large=True
-                                    )
-
+                        with vuetify.VCol(cols="12", sm="11", md="9", lg="8"):
+                            html.Iframe(
+                                src="/mltool/ml_tool.html",
+                                style="width: 100%; height: 620px; border: 0; border-radius: 16px; background: transparent;",
+                            )
                 # --- VIEWER TAB ---
                 with vuetify.VTabItem():
                     with vuetify.VRow(classes="mt-2", spacing=4):

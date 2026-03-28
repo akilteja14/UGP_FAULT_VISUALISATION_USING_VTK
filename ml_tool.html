@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ML Fault Extraction</title>
+  <style>
+    body {
+      margin: 0;
+      font-family: Inter, Segoe UI, sans-serif;
+      background: linear-gradient(145deg, rgba(22, 27, 34, 0.96), rgba(16, 20, 26, 0.96));
+      color: #e2e8f0;
+    }
+
+    .panel {
+      min-height: 100vh;
+      box-sizing: border-box;
+      padding: 28px;
+      border: 1px solid rgba(255, 255, 255, 0.06);
+      border-radius: 16px;
+    }
+
+    h2 {
+      margin: 0 0 8px;
+      font-size: 1.4rem;
+    }
+
+    p {
+      margin: 0 0 16px;
+      color: #a9b7c9;
+      line-height: 1.5;
+    }
+
+    .box {
+      border: 2px dashed rgba(88, 166, 255, 0.3);
+      border-radius: 16px;
+      padding: 24px;
+      background: rgba(13, 17, 23, 0.45);
+    }
+
+    input[type="file"] {
+      width: 100%;
+      box-sizing: border-box;
+      color: #e2e8f0;
+      background: rgba(255,255,255,0.03);
+      border: 1px solid rgba(255,255,255,0.12);
+      border-radius: 10px;
+      padding: 12px;
+    }
+
+    button, a.download {
+      display: inline-block;
+      margin-top: 16px;
+      padding: 12px 20px;
+      border-radius: 999px;
+      border: none;
+      background: linear-gradient(90deg, #00d2ff 0%, #3a7bd5 100%);
+      color: #fff;
+      font-weight: 600;
+      text-decoration: none;
+      cursor: pointer;
+    }
+
+    button:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+
+    .status {
+      margin-top: 20px;
+      color: #6fe7ff;
+      font-weight: 600;
+    }
+
+    .meta {
+      margin-top: 8px;
+      color: #a9b7c9;
+      font-size: 0.92rem;
+      min-height: 20px;
+    }
+
+    .filename {
+      margin-top: 14px;
+      color: #fff;
+    }
+
+    .output {
+      margin-top: 24px;
+      display: none;
+    }
+
+    .output-label {
+      color: #a9b7c9;
+      font-size: 0.85rem;
+      margin-bottom: 8px;
+    }
+
+    .output-path {
+      word-break: break-all;
+    }
+  </style>
+</head>
+<body>
+  <div class="panel">
+    <h2>Deep Learning Fault Extraction</h2>
+    <p>Choose a SEG-Y file, wait for upload to finish, then run fault extraction.</p>
+
+    <div class="box">
+      <input id="ml-upload-input" type="file" accept=".segy,.sgy">
+      <div id="ml-selected-name" class="filename">No file selected yet</div>
+      <button id="ml-run-btn" disabled>Run Fault Extraction</button>
+    </div>
+
+    <div id="ml-status" class="status">Awaiting File...</div>
+    <div id="ml-meta" class="meta"></div>
+
+    <div id="ml-output-wrap" class="output">
+      <div class="output-label">Generated output file</div>
+      <div id="ml-output-path" class="output-path"></div>
+      <a id="ml-download-link" class="download" href="#" download target="_blank">Download Extracted Faults</a>
+    </div>
+  </div>
+
+  <script>
+    (() => {
+      let uploadedPath = "";
+
+      const input = document.getElementById("ml-upload-input");
+      const runBtn = document.getElementById("ml-run-btn");
+      const statusEl = document.getElementById("ml-status");
+      const selectedEl = document.getElementById("ml-selected-name");
+      const outputWrap = document.getElementById("ml-output-wrap");
+      const outputPath = document.getElementById("ml-output-path");
+      const downloadLink = document.getElementById("ml-download-link");
+      const metaEl = document.getElementById("ml-meta");
+      let progressTimer = null;
+
+      function stopProgressPolling() {
+        if (progressTimer) {
+          clearInterval(progressTimer);
+          progressTimer = null;
+        }
+      }
+
+      async function refreshMlStatus() {
+        try {
+          const response = await fetch(`${window.location.origin}/ml_status`);
+          const payload = await response.json();
+
+          if (payload.message) {
+            const percentText = typeof payload.percent === "number" ? ` (${Math.round(payload.percent)}%)` : "";
+            statusEl.textContent = `${payload.message}${payload.running ? percentText : ""}`;
+          }
+
+          if (payload.total_patches) {
+            const completed = payload.completed_patches || 0;
+            const total = payload.total_patches || 0;
+            const eta = payload.eta_seconds ? ` | ETA ${Math.round(payload.eta_seconds)}s` : "";
+            metaEl.textContent = `Patches ${completed}/${total}${eta}`;
+          } else {
+            metaEl.textContent = "";
+          }
+
+          if (!payload.running && (payload.stage === "complete" || payload.stage === "error")) {
+            stopProgressPolling();
+          }
+        } catch (error) {
+          console.error(error);
+        }
+      }
+
+      input.addEventListener("change", async (event) => {
+        const files = event.target.files;
+        if (!files || !files.length) return;
+
+        const file = files[0];
+        selectedEl.textContent = file.name;
+        statusEl.textContent = `Uploading: ${file.name} (0%)`;
+        outputWrap.style.display = "none";
+        outputPath.textContent = "";
+        runBtn.disabled = true;
+
+        const formData = new FormData();
+        formData.append("file", file);
+
+        try {
+          const payload = await new Promise((resolve, reject) => {
+            const xhr = new XMLHttpRequest();
+            xhr.open("POST", `${window.location.origin}/upload_ml`);
+            xhr.responseType = "json";
+
+            xhr.upload.addEventListener("progress", (progressEvent) => {
+              if (progressEvent.lengthComputable) {
+                const percent = Math.round((progressEvent.loaded / progressEvent.total) * 100);
+                statusEl.textContent = `Uploading: ${file.name} (${percent}%)`;
+              }
+            });
+
+            xhr.addEventListener("load", () => {
+              const response = xhr.response || {};
+              if (xhr.status < 200 || xhr.status >= 300) {
+                reject(new Error(response.error || `HTTP ${xhr.status}`));
+                return;
+              }
+              resolve(response);
+            });
+
+            xhr.addEventListener("error", () => reject(new Error("Network error during upload")));
+            xhr.send(formData);
+          });
+
+          uploadedPath = payload.saved_path;
+          statusEl.textContent = `Upload complete: ${payload.filename}`;
+          metaEl.textContent = "";
+          runBtn.disabled = false;
+        } catch (error) {
+          uploadedPath = "";
+          statusEl.textContent = `Upload failed: ${error.message || "Unknown error"}`;
+          metaEl.textContent = "";
+        } finally {
+          event.target.value = "";
+        }
+      });
+
+      runBtn.addEventListener("click", async () => {
+        if (!uploadedPath) {
+          statusEl.textContent = "Browse and upload a SEG-Y file first.";
+          return;
+        }
+
+        runBtn.disabled = true;
+        outputWrap.style.display = "none";
+        outputPath.textContent = "";
+        statusEl.textContent = "Running fault extraction...";
+        metaEl.textContent = "";
+        stopProgressPolling();
+        progressTimer = setInterval(refreshMlStatus, 1500);
+        refreshMlStatus();
+
+        try {
+          const response = await fetch(`${window.location.origin}/run_ml`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ input_path: uploadedPath })
+          });
+          const payload = await response.json();
+
+          if (!response.ok) {
+            statusEl.textContent = `Run failed: ${payload.error || "Unknown error"}`;
+            stopProgressPolling();
+            runBtn.disabled = false;
+            return;
+          }
+
+          statusEl.textContent = "Process Finished. Success!";
+          outputPath.textContent = payload.output_path;
+          downloadLink.href = payload.download_url;
+          outputWrap.style.display = "block";
+          stopProgressPolling();
+          runBtn.disabled = false;
+        } catch (error) {
+          statusEl.textContent = `Run failed: ${error.message || "Unknown error"}`;
+          stopProgressPolling();
+          runBtn.disabled = false;
+        }
+      });
+    })();
+  </script>
+</body>
+</html>
