@@ -4,10 +4,16 @@ import threading
 import uuid
 import asyncio
 from urllib.parse import quote
+import numpy as np
+import requests
 from aiohttp import web
 from trame.app import get_server
 from trame.ui.vuetify import SinglePageLayout
 from trame.widgets import vuetify, html
+from trame.widgets import vtk as vtk_widgets
+import vtk
+
+from VTK_PY.segy_viewer import build_vtk_image, build_mapper, create_actors
 
 processing = None
 try:
@@ -20,6 +26,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.abspath(os.path.join(BASE_DIR, ".."))
 UPLOAD_DIR = os.path.join(PROJECT_ROOT, "data", "uploads")
 OUTPUT_DIR = os.path.join(PROJECT_ROOT, "data", "outputs")
+SLICE_SERVER_URL = "http://localhost:5000"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -35,6 +42,17 @@ class AppBackend:
         self.cube = None
         self.color_mapper = None
         self.shape = (100, 100, 100)
+        self.viewer_ready = False
+        self.loaded_path = ""
+
+        self.renderer = vtk.vtkRenderer()
+        self.window = vtk.vtkRenderWindow()
+        self.window.SetOffScreenRendering(1)
+        self.window.AddRenderer(self.renderer)
+
+        self.interactor = vtk.vtkRenderWindowInteractor()
+        self.interactor.SetRenderWindow(self.window)
+        self.interactor.SetInteractorStyle(vtk.vtkInteractorStyleTrackballCamera())
 
 backend = AppBackend()
 
@@ -65,7 +83,8 @@ state.ml_selected_name = ""
 state.ml_ready_to_run = False
 
 state.viewer_processing = False
-state.viewer_status_msg = "Ready"
+state.viewer_status_msg = "Waiting for slice server"
+state.viewer_loaded_name = ""
 
 state.iline_check = False
 state.iline_val = 0
@@ -80,6 +99,69 @@ state.time_val = 0
 state.time_max = 100
 
 # --- Handlers ---
+def configure_slice_server(file_path):
+    response = requests.post(
+        f"{SLICE_SERVER_URL}/load",
+        json={"path": file_path},
+        timeout=120,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def fetch_slice(inline_idx, crossline_idx, time_idx, mode):
+    response = requests.get(
+        f"{SLICE_SERVER_URL}/slice",
+        params={
+            "inline": inline_idx,
+            "crossline": crossline_idx,
+            "time": time_idx,
+            "mode": mode,
+        },
+        timeout=30,
+    )
+    response.raise_for_status()
+    return np.array(response.json()["data"], dtype=np.float32)
+
+
+def build_sparse_remote_cube():
+    volume = np.zeros(backend.shape, dtype=np.float32)
+    fetched_slices = []
+
+    if state.iline_check:
+        inline_slice = fetch_slice(state.iline_val, 0, 0, "inline")
+        volume[state.iline_val, :, :] = inline_slice
+        fetched_slices.append(inline_slice)
+
+    if state.xline_check:
+        cross_slice = fetch_slice(0, state.xline_val, 0, "crossline")
+        volume[:, state.xline_val, :] = cross_slice
+        fetched_slices.append(cross_slice)
+
+    if state.time_check:
+        time_slice = fetch_slice(0, 0, state.time_val, "time")
+        volume[:, :, state.time_val] = time_slice
+        fetched_slices.append(time_slice)
+
+    return volume, fetched_slices
+
+
+def initialize_viewer(shape, loaded_path):
+    backend.shape = tuple(shape)
+    backend.viewer_ready = True
+    backend.loaded_path = loaded_path
+
+    state.iline_max = backend.shape[0] - 1
+    state.xline_max = backend.shape[1] - 1
+    state.time_max = backend.shape[2] - 1
+
+    state.iline_val = min(state.iline_val or backend.shape[0] // 2, state.iline_max)
+    state.xline_val = min(state.xline_val or backend.shape[1] // 2, state.xline_max)
+    state.time_val = min(state.time_val or backend.shape[2] // 2, state.time_max)
+    state.viewer_loaded_name = os.path.basename(loaded_path)
+    state.viewer_status_msg = f"Loaded {state.viewer_loaded_name}"
+
+
 def handle_ml_upload(file_path=None):
     input_path = (file_path or state.ml_input_path or "").strip()
     if not input_path:
@@ -109,12 +191,22 @@ def handle_ml_upload(file_path=None):
             output_path = processing.build_ml_output_path(input_path, OUTPUT_DIR)
             processing.run_ml_extraction(input_path, output_path)
             download_name = quote(os.path.basename(output_path))
+            viewer_message = "Visualization server not updated yet."
+            try:
+                metadata = configure_slice_server(output_path)
+                with state:
+                    initialize_viewer(metadata["shape"], output_path)
+                update_slices()
+                viewer_message = f"Viewer ready: {os.path.basename(output_path)}"
+            except Exception as viewer_err:
+                viewer_message = f"Viewer server issue: {viewer_err}"
             with state:
                 state.ml_status_msg = "Process Finished. Success!"
                 state.ml_output_path = output_path
                 state.ml_download_url = f"/outputs/{download_name}"
                 state.ml_result_ready = True
                 state.ml_ready_to_run = True
+                state.viewer_status_msg = viewer_message
         except Exception as err:
             with state:
                 state.ml_status_msg = f"Error: {str(err)}"
@@ -258,6 +350,31 @@ async def run_ml_file(request):
             "output_path": output_path,
         }
     )
+    viewer_message = "Visualization server not updated yet."
+    try:
+        metadata = await asyncio.to_thread(configure_slice_server, output_path)
+        with state:
+            state.ml_processing = False
+            state.ml_status_msg = "Process Finished. Success!"
+            state.ml_output_path = output_path
+            state.ml_download_url = f"/outputs/{quote(os.path.basename(output_path))}"
+            state.ml_result_ready = True
+            state.ml_ready_to_run = True
+            initialize_viewer(metadata["shape"], output_path)
+        update_slices()
+        viewer_message = f"Viewer ready: {os.path.basename(output_path)}"
+    except Exception as viewer_err:
+        with state:
+            state.ml_processing = False
+            state.ml_status_msg = "Process Finished. Success!"
+            state.ml_output_path = output_path
+            state.ml_download_url = f"/outputs/{quote(os.path.basename(output_path))}"
+            state.ml_result_ready = True
+            state.ml_ready_to_run = True
+        viewer_message = f"Viewer server issue: {viewer_err}"
+
+    with state:
+        state.viewer_status_msg = viewer_message
     return web.json_response(
         {
             "output_path": output_path,
@@ -265,25 +382,67 @@ async def run_ml_file(request):
         }
     )
 
-def handle_viewer_upload(file_path):
-    if not file_path:
+def handle_viewer_upload(file_path=None):
+    target_path = (file_path or state.ml_output_path or "").strip()
+    if not target_path:
+        state.viewer_status_msg = "Run ML first so there is an output SEG-Y to visualize."
         return
-    
+
     state.viewer_processing = True
-    state.viewer_status_msg = "Processing file..."
-    
+    state.viewer_status_msg = "Connecting to slice server..."
+
     try:
-        backend.shape = (100, 100, 100)
+        metadata = configure_slice_server(target_path)
+        initialize_viewer(metadata["shape"], target_path)
+        update_slices()
+    except Exception as err:
+        state.viewer_status_msg = f"Viewer Error: {str(err)}"
+    finally:
+        state.viewer_processing = False
 
-        state.iline_max = 99
-        state.xline_max = 99
-        state.time_max = 99
 
-        state.iline_val = 50
-        state.xline_val = 50
-        state.time_val = 50
+@state.change("iline_val", "xline_val", "time_val", "iline_check", "xline_check", "time_check")
+def update_slices(**kwargs):
+    if not backend.viewer_ready:
+        return
 
-        state.viewer_status_msg = f"Ready: {os.path.basename(file_path)}"
+    backend.renderer.RemoveAllViewProps()
+
+    if not any((state.iline_check, state.xline_check, state.time_check)):
+        backend.window.Render()
+        ctrl.view_update()
+        return
+
+    state.viewer_processing = True
+
+    try:
+        sparse_cube, fetched_slices = build_sparse_remote_cube()
+        amplitudes = np.concatenate([slice_.flatten() for slice_ in fetched_slices])
+
+        image = build_vtk_image(sparse_cube)
+        mapper = build_mapper(image, amplitudes)
+        actors = create_actors(
+            mapper,
+            state.iline_val,
+            state.xline_val,
+            state.time_val,
+            backend.shape,
+        )
+
+        if state.iline_check:
+            backend.renderer.AddActor(actors[0])
+        if state.xline_check:
+            backend.renderer.AddActor(actors[1])
+        if state.time_check:
+            backend.renderer.AddActor(actors[2])
+
+        backend.renderer.ResetCamera()
+        backend.window.Render()
+        state.viewer_status_msg = (
+            f"Showing {state.viewer_loaded_name or 'volume'} "
+            f"I:{state.iline_val} X:{state.xline_val} T:{state.time_val}"
+        )
+        ctrl.view_update()
     except Exception as err:
         state.viewer_status_msg = f"Viewer Error: {str(err)}"
     finally:
@@ -635,16 +794,16 @@ with SinglePageLayout(server) as layout:
                                 
                                 # Section 1: Data
                                 html.Div("Data Source", classes="section-title")
-                                vuetify.VFileInput(
-                                    label="Load SEGY Volume",
-                                    dense=True,
-                                    outlined=True,
-                                    hide_details=True,
-                                    prepend_inner_icon="mdi-database",
-                                    prepend_icon="",
-                                    color="#00d2ff",
-                                    classes="mb-2",
-                                    dark=True
+                                html.P(
+                                    "Start `VTK_PY/server.py`, run ML, then load the latest generated SEG-Y here.",
+                                    classes="text-body-2 grey--text text--lighten-1 mb-3"
+                                )
+                                vuetify.VBtn(
+                                    "Load Latest ML Output",
+                                    block=True,
+                                    rounded=True,
+                                    class_="glow-btn mb-3",
+                                    click=handle_viewer_upload,
                                 )
                                 html.Div("{{ viewer_status_msg }}", classes="text-caption cyan--text mb-6")
 
@@ -683,20 +842,17 @@ with SinglePageLayout(server) as layout:
                         # Right panel - Viewer
                         with vuetify.VCol(cols="12", md="8", lg="9"):
                             with vuetify.VCard(
-                                classes="viewer-box d-flex align-center justify-center",
+                                classes="viewer-box",
                                 style="height: 100%; min-height: 600px;",
                                 dark=True
                             ):
                                 html.Div(classes="viewer-empty-bg")
-                                
-                                html.Img(v_if=("img_src",),
-                                         src=("img_src",),
-                                         style="max-width:100%; max-height:100%; border-radius: 8px; z-index: 1; position: relative;")
-
-                                with html.Div(v_if=("!img_src",), classes="text-center", style="z-index: 1;"):
-                                    vuetify.VIcon("mdi-axis-arrow", size=72, color="rgba(255,255,255,0.1)", classes="mb-4 pulse-icon")
-                                    html.H4("3D Workspace Empty", classes="text-h6 grey--text text--lighten-1 font-weight-regular")
-                                    html.P("Load a dataset from the left panel to begin visualization.", classes="text-body-2 grey--text text--darken-1")
+                                vtk_view = vtk_widgets.VtkRemoteView(
+                                    backend.window,
+                                    interactive_ratio=1,
+                                    style="width: 100%; height: 600px; position: relative; z-index: 1;",
+                                )
+                                ctrl.view_update = vtk_view.update
 
                 # --- ANALYSIS TAB ---
                 with vuetify.VTabItem():
