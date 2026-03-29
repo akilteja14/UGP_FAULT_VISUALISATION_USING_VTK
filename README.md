@@ -40,6 +40,18 @@ The current UI is built with `trame`
   Contains model files used by `ml_core.py`:
   - `model3.json`
   - `pretrained_model.hdf5`
+  - `pretrained_model.hdf5` is tracked with Git LFS.
+  - After cloning, run the following to download the actual weights file:
+
+```bash
+git lfs install
+git clone <your-repo-url>
+cd UGP_FAULT_VISUALISATION_USING_VTK
+git lfs pull
+```
+
+  - If `model/pretrained_model.hdf5` is missing locally, the ML pipeline will not run.
+
 
 - `../data/uploads/`
   Stores uploaded SEG-Y input files.
