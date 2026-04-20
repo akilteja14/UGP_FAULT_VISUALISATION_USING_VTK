@@ -115,20 +115,29 @@ def index_volume(file_path):
     Returns:
         dict: Metadata with the file path and volume shape, sent back to frontend.
     """
+    #telling to use the global variables defined above
     global loaded_path, volume_shape, trace_map, unique_inlines, unique_crosslines
 
+    #gives absolute path to the file_path(output segy file)...
     normalized_path = os.path.abspath(file_path)
+
+    #effectively if path doesn't exist the file doesn't exist...
     if not os.path.exists(normalized_path):
         raise FileNotFoundError(f"SEG-Y file not found: {normalized_path}")
 
+    #we always do ignore_geometry = true because we want to build the cube
+    #geometry on our own, if we use segyio geometry construction it raises
+    #errors for every small mistake(like header doesn't exist for a trace or so)
     with segyio.open(normalized_path, ignore_geometry=True) as segy_file:
         # -- Read inline and crossline indices from trace headers --
         # We try the standard TraceField enum first, then fall back to raw
         # byte offsets (181 and 185) for non-standard SEG-Y files.
         try:
+            #creating inlines and crosslines array.
             inlines    = segy_file.attributes(segyio.TraceField.INLINE_3D)[:]
             crosslines = segy_file.attributes(segyio.TraceField.CROSSLINE_3D)[:]
         except Exception:
+            #for non standard segy files
             inlines    = segy_file.attributes(181)[:]
             crosslines = segy_file.attributes(185)[:]
 
@@ -138,6 +147,8 @@ def index_volume(file_path):
         n_samples     = len(segy_file.samples)
 
         # -- Build reverse lookup dictionaries for O(1) index resolution --
+        # a map where key is inline_val and key-value is inline_idx to get the range
+        # of inline values to be continuous values.
         inline_index    = {val: idx for idx, val in enumerate(uq_inlines)}
         crossline_index = {val: idx for idx, val in enumerate(uq_crosslines)}
 
@@ -152,6 +163,9 @@ def index_volume(file_path):
 
         # Walk through every trace in the file (header-only, no amplitude data)
         # and populate the trace_map with the trace's position in the file.
+
+        #continue....
+        #way to storing new_trace_map[i, j] = trace_id 
         for trace_id in range(segy_file.tracecount):
             il  = inlines[trace_id]
             xl  = crosslines[trace_id]
@@ -161,6 +175,7 @@ def index_volume(file_path):
                 new_trace_map[i, j] = trace_id
 
     # -- Update global state under the lock --
+    # so that concurrent access cannot corrupt the global variables
     with volume_lock:
         loaded_path       = normalized_path
         volume_shape      = (len(uq_inlines), len(uq_crosslines), n_samples)
@@ -175,6 +190,9 @@ def index_volume(file_path):
 # -- On-Demand Slice Reading --
 # =============================================================================
 
+# Reads one inline slice from the loaded SEG-Y file.
+# For a fixed inline index, it reads all crossline traces across all time samples
+# using trace_map and returns a 2D array of shape crosslines x samples.
 def read_inline_slice(slice_index):
     """
     Read a single INLINE slice directly from the SEG-Y file on disk.
@@ -209,6 +227,9 @@ def read_inline_slice(slice_index):
     return result
 
 
+# Reads one crossline slice from the loaded SEG-Y file.
+# For a fixed crossline index, it reads all inline traces across all time samples
+# and returns a 2D array of shape inlines x samples.
 def read_crossline_slice(slice_index):
     """
     Read a single CROSSLINE slice directly from the SEG-Y file on disk.
@@ -234,7 +255,9 @@ def read_crossline_slice(slice_index):
 
     return result
 
-
+# Reads one horizontal time/depth slice from the loaded SEG-Y file.
+# For a fixed sample index, it reads that sample from every inline-crossline trace
+# and returns a 2D array of shape inlines x crosslines.
 def read_time_slice(slice_index):
     """
     Read a single TIME slice directly from the SEG-Y file on disk.
@@ -286,7 +309,7 @@ def status():
             "shape":  list(volume_shape) if volume_shape else None,
         })
 
-
+#if load endpoint is triggered via a HTTP POST request run this function 
 @app.route("/load", methods=["POST"])
 def load():
     """
@@ -301,19 +324,32 @@ def load():
     Returns:
         JSON: { path: str, shape: [n_inlines, n_crosslines, n_samples] }
     """
+    #receives the output segy file as json from the function
+    #configure_slice_server with path as key
+
+    #silent = true -> invalid json no error but payload becomes none or {}
     payload   = request.get_json(silent=True) or {}
+    #strip removes trailing and leading whitespace (just for safety)
     file_path = (payload.get("path") or "").strip()
+
+    #if file path is none we send an error json message and HTTP status code
+    #400 indicating it is an error to configure_slice_server function
     if not file_path:
         return jsonify({"error": "Missing SEG-Y path."}), 400
 
+    #continue....
     try:
+        #gets metadata from the function index_volume
         metadata = index_volume(file_path)
     except Exception as err:
+        #if any error sends an HTTP post request 500 indicating an error
+        #sends json of the error message
         return jsonify({"error": str(err)}), 500
 
+    #returns json of metadata
     return jsonify(metadata)
 
-
+#run this function when it recieves an get request to /slice endpoint from frontend 
 @app.route("/slice", methods=["GET"])
 def get_slice():
     """
@@ -333,33 +369,49 @@ def get_slice():
         JSON: { shape: [int, int], data: [[...], ...] }
     """
     with volume_lock:
+        #if there is no loaded_path or trace_map is none then return error
+        #with HTTP STATUS 400 to frontend
         if loaded_path == "" or trace_map is None:
             return jsonify({"error": "No SEG-Y volume loaded. Call /load first."}), 400
 
+        #using default "mode" as inline and we use "mode" from the
+        #json we recieve from frontend...
         mode = request.args.get("mode", "inline")
 
     try:
         if mode == "inline":
-            # Vertical plane: cut along all crosslines and time for a fixed inline
+            #Vertical plane: cut along all crosslines and time for a fixed inline
+            #get's inline value from "inline" key in json...
             inline_idx = int(request.args.get("inline", 0))
+            #continue...
+            #2d numpy array of seiemic ampltiudes along all crosslines and time samples
             data = read_inline_slice(inline_idx)
 
         elif mode == "crossline":
-            # Vertical plane: cut along all inlines and time for a fixed crossline
+            #Vertical plane: cut along all inlines and time for a fixed crossline
+            #get's crossline value from "crossline" key in json...
             crossline_idx = int(request.args.get("crossline", 0))
+            #similarily...
             data = read_crossline_slice(crossline_idx)
 
         elif mode == "time":
-            # Horizontal plane: a snapshot of the entire survey at one time sample
+            #Horizontal plane: a snapshot of the entire survey at one time sample
+            #get's time value from "time" key in json...
             time_idx = int(request.args.get("time", 0))
+            #similarily...
             data = read_time_slice(time_idx)
 
         else:
+            #unsupported slice mode error returned to frontend with HTTP STATUS code 400,
+            #to fetch_slice function...
             return jsonify({"error": f"Unsupported slice mode: '{mode}'"}), 400
 
     except Exception as err:
+        #if any error returns HTTP STATUS code 500 to the frontend...
         return jsonify({"error": str(err)}), 500
 
+    #if everything works as expected we send shape and data(as list) to frontend
+    #fetch_slice function in json format
     return jsonify({"shape": list(data.shape), "data": data.tolist()})
 
 

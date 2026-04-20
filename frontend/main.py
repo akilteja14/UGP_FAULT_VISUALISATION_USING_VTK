@@ -76,17 +76,29 @@ state.time_val = 0
 state.time_max = 100
 
 # --- proxy API functions ---
+# Sends the selected SEG-Y file path to the Flask backend.
+# The backend indexes the file headers and returns volume metadata,
+# mainly the 3D shape: inline count, crossline count, and time sample count.
 def configure_slice_server(file_path):
+    #sending a post request to the BACKEND_URL/load
+    #(responsible for loading data corresponding to the 
+    # file_path in the server)
+    #file_path is mostly the output segy file here
     response = requests.post(
         f"{BACKEND_URL}/load",
         json={"path": file_path},
         timeout=120,
     )
+    #this recieves HTTP status and if it 200-299 then this is passed
+    #if it is >=400 this line will raise an error.
     response.raise_for_status()
+
     return response.json()
 
 
 def fetch_slice(inline_idx, crossline_idx, time_idx, mode):
+    #sending an HTTP GET request to BACKEND_URL/slice endpoint
+    #params -> qurey parameters in URL
     response = requests.get(
         f"{BACKEND_URL}/slice",
         params={
@@ -97,14 +109,25 @@ def fetch_slice(inline_idx, crossline_idx, time_idx, mode):
         },
         timeout=30,
     )
+
+    #continue...
+    #if everything works good i.e. gets a status code 200-299 ok
+    #else if it gets status code >=400 it raises an error
     response.raise_for_status()
+
+    #gets the data in the slice from backend as json which is extracted and 
+    #converted into an numpy array...
+
+    #go to build_sparse_remote_cube function
     return np.array(response.json()["data"], dtype=np.float32)
 
-
+#building a sparse remote cube full of zeroes except required 3 slices
+#using backend.shape...
 def build_sparse_remote_cube():
     volume = np.zeros(backend.shape, dtype=np.float32)
     fetched_slices = []
 
+    #if iline button is on then do this...
     if state.iline_check:
         inline_slice = fetch_slice(state.iline_val, 0, 0, "inline")
         volume[state.iline_val, :, :] = inline_slice
@@ -120,22 +143,35 @@ def build_sparse_remote_cube():
         volume[:, :, state.time_val] = time_slice
         fetched_slices.append(time_slice)
 
+    #return the volume with amplitudes and fetched_slices
     return volume, fetched_slices
 
+# Initializes the 3D viewer after the backend has indexed a SEG-Y file.
+# It stores the volume shape, enables viewer readiness, sets slider ranges,
+# chooses default slice positions, and updates the loaded-file status message.
 
+#called from handle_viewer_upload function (at line 300)...
 def initialize_viewer(shape, loaded_path):
+    #storing the backend shape as a tuple
     backend.shape = tuple(shape)
+    #telling the user the data is loaded and ready to view
     backend.viewer_ready = True
+    #telling the backend about the loaded path
     backend.loaded_path = loaded_path
 
+    #setting max values
     state.iline_max = backend.shape[0] - 1
     state.xline_max = backend.shape[1] - 1
     state.time_max = backend.shape[2] - 1
 
+    #if a value is used use that or default middle but can't cross maximum value
     state.iline_val = min(state.iline_val or backend.shape[0] // 2, state.iline_max)
     state.xline_val = min(state.xline_val or backend.shape[1] // 2, state.xline_max)
     state.time_val = min(state.time_val or backend.shape[2] // 2, state.time_max)
+
+    #state.viewer_loaded_name stores the file name
     state.viewer_loaded_name = os.path.basename(loaded_path)
+    #tells the user in a viewable message on UI that Loaded this file.
     state.viewer_status_msg = f"Loaded {state.viewer_loaded_name}"
 
 
@@ -186,8 +222,13 @@ async def run_ml_file(request):
                         return web.json_response({"error": data.get("message")}, status=500)
                     elif data.get("stage") == "complete":
                         # Tell UI what the backend output path is
+
+                        #as ML model runs in the backend server we get the path 
+                        #to the output file in backend and we store that path in 
+                        #frontend here...
                         output_path = data.get("output_path")
                         with state:
+                            #state.ml_output_path store the path to output segy file
                             state.ml_output_path = output_path
                         return web.json_response({
                             "output_path": output_path,
@@ -222,57 +263,95 @@ def bind_server_routes(wslink_server):
 
 ctrl.on_server_bind.add(bind_server_routes)
 
-
+#Loads the latest ML-generated SEG-Y file into the 3D workspace.
+#It gets the output file path from frontend state or backend ML status,
+#asks the backend slice server to index the file, initializes slider limits,
+#and triggers the first viewer update.
+#file_path = None means it is allowed to call this function with or without an argument...
 def handle_viewer_upload(file_path=None):
+    #If a file path is directly given, use that,
+    #Otherwise use state.ml_output_path,
+    #Otherwise use empty string...
     target_path = (file_path or state.ml_output_path or "").strip()
     
+    #if target_path is empty then we ask backend for latest ML status
     if not target_path:
         try:
+            #sending HTTP GET requests to Backend using requests library and
+            #get's to know about the ML STATUS
             resp = requests.get(f"{BACKEND_URL}/ml_status", timeout=5)
+
+            #200 -> ok response
             if resp.status_code == 200:
+                #returns ML job status as json which has stage and output_path as keys..
                 data = resp.json()
                 if data.get("stage") == "complete" and data.get("output_path"):
                     target_path = data.get("output_path")
                     with state:
                         state.ml_output_path = target_path
+
         except Exception:
             pass
 
+    #if we didn't get target_path after the get request then we should run the 
+    #ML model first on input file.
     if not target_path:
         state.viewer_status_msg = "Run ML first so there is an output SEG-Y to visualize."
         return
 
+    #continue...
+    #flag for viewer_processing *dbt*
     state.viewer_processing = True
+    #shows user the message.
     state.viewer_status_msg = f"Connecting to {BACKEND_URL}..."
 
     try:
+        #we get metadata from configure_slice_server function(line 79)
+        #metadata -> no_of_iline * no_of_xline * no_of_time...
         metadata = configure_slice_server(target_path)
+
+        #backend stores some info and the sliders are initialized
         initialize_viewer(metadata["shape"], target_path)
+
+        #continue...
         update_slices()
     except Exception as err:
         state.viewer_status_msg = f"Viewer Error: {str(err)}"
     finally:
         state.viewer_processing = False
 
-
+#for any state change for mentioned variables invoke this function...
+#iline_val -> new inline value, iline_check -> inline switch state...
 @state.change("iline_val", "xline_val", "time_val", "iline_check", "xline_check", "time_check")
 def update_slices(**kwargs):
+    #**kwargs -> recieves info about what has changed...
+    #if backend.viewer_ready -> false data is not loaded yet so return...
     if not backend.viewer_ready:
         return
 
+    #remove all existing actors
     backend.renderer.RemoveAllViewProps()
 
+    #if all conditions are false, refresh empty view and exit...
     if not any((state.iline_check, state.xline_check, state.time_check)):
         backend.window.Render()
         ctrl.view_update()
         return
 
+    #else if any one changes mark viewer as busy and it loads the new slice from
+    #backend...
     state.viewer_processing = True
 
     try:
+        #continue...
+        #fetched_slices is an array of fetched slices(inline,crossline,time)
+        #sparse_cube is volume data of seismic amplitudes
         sparse_cube, fetched_slices = build_sparse_remote_cube()
+        #we are forming a 1D array of amplitudes here because for color scaling,
+        #finding outliers it is simple and quick to deal with 1D arrays...
         amplitudes = np.concatenate([slice_.flatten() for slice_ in fetched_slices])
 
+        #go to segy_viewer.py...
         image = build_vtk_image(sparse_cube)
         mapper = build_mapper(image, amplitudes)
         actors = create_actors(
@@ -283,23 +362,36 @@ def update_slices(**kwargs):
             backend.shape,
         )
 
+        #if inline button is on add inline slice actor to renderer
         if state.iline_check:
             backend.renderer.AddActor(actors[0])
+        #similarily
         if state.xline_check:
             backend.renderer.AddActor(actors[1])
+        #similarily
         if state.time_check:
             backend.renderer.AddActor(actors[2])
 
+        #sets a default camera position to view all slices
         backend.renderer.ResetCamera()
+        #telling the renderers to render on screen(web)
         backend.window.Render()
+
+        #shows the user a message about which inline, crossline and time slice
+        #is being viewed
         state.viewer_status_msg = (
             f"Showing {state.viewer_loaded_name or 'volume'} "
             f"I:{state.iline_val} X:{state.xline_val} T:{state.time_val}"
         )
+
+        #just refreshes the screen
         ctrl.view_update()
+    
+    #error handling
     except Exception as err:
         state.viewer_status_msg = f"Viewer Error: {str(err)}"
     finally:
+        #finally viewer_processing is done so the flag is set to false
         state.viewer_processing = False
 
 
@@ -441,6 +533,7 @@ with SinglePageLayout(server) as layout:
                     vuetify.VIcon("mdi-brain", classes="mr-2", size=18)
                     html.Span("ML Processing")
                 with vuetify.VTab():
+                    #visualisation page...
                     vuetify.VIcon("mdi-cube-outline", classes="mr-2", size=18)
                     html.Span("3D Workspace")
                 with vuetify.VTab():
@@ -464,6 +557,9 @@ with SinglePageLayout(server) as layout:
                                     "Ensure backend is running, wait for ML, then load the generated SEG-Y here.",
                                     classes="text-body-2 grey--text text--lighten-1 mb-3"
                                 )
+                                #load latest ML Output button
+                                #on_click runs the function handle_viewer_upload 
+                                #which does everything which we want...
                                 vuetify.VBtn(
                                     "Load Latest ML Output",
                                     block=True,
@@ -471,6 +567,8 @@ with SinglePageLayout(server) as layout:
                                     class_="glow-btn mb-3",
                                     click=handle_viewer_upload,
                                 )
+
+                                #slices buttons code
                                 html.Div("{{ viewer_status_msg }}", classes="text-caption cyan--text mb-6")
 
                                 vuetify.VDivider(dark=True, classes="mb-6", style="border-color: rgba(255,255,255,0.05);")
@@ -500,6 +598,7 @@ with SinglePageLayout(server) as layout:
                                 vuetify.VSlider(v_if=("time_check",), v_model=("time_val",), min=0, max=("time_max",), 
                                                 color="#b388ff", track_color="grey darken-3", thumb_label=True, classes="mt-1", dark=True)
 
+                        #viewer panel for slices
                         with vuetify.VCol(cols="12", md="8", lg="9"):
                             with vuetify.VCard(
                                 classes="viewer-box",
@@ -507,6 +606,7 @@ with SinglePageLayout(server) as layout:
                                 dark=True
                             ):
                                 html.Div(classes="viewer-empty-bg")
+                                #this is our place where we view the slices
                                 vtk_view = vtk_widgets.VtkRemoteView(
                                     backend.window,
                                     interactive_ratio=1,
@@ -527,3 +627,4 @@ if __name__ == "__main__":
     print("Starting Seismic Portal Pro on http://localhost:8081")
     print(f"Communicating with Backend Server at: {BACKEND_URL}")
     server.start(port=8081)
+    #server.start(host="0.0.0.0", port=8081)
