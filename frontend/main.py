@@ -33,6 +33,12 @@ class AppBackend:
         self.shape = (100, 100, 100)
         self.viewer_ready = False
         self.loaded_path = ""
+        # (new comment): Dictionary to cache fetched slices, preventing redundant API calls
+        self.cache = {
+            "inline": {"val": None, "data": None},
+            "crossline": {"val": None, "data": None},
+            "time": {"val": None, "data": None},
+        }
 
         self.renderer = vtk.vtkRenderer()
         self.window = vtk.vtkRenderWindow()
@@ -59,7 +65,6 @@ state.ml_download_url = ""
 state.ml_selected_name = ""
 state.ml_ready_to_run = False
 
-state.viewer_processing = False
 state.viewer_status_msg = "Waiting for slice server"
 state.viewer_loaded_name = ""
 
@@ -93,6 +98,7 @@ def configure_slice_server(file_path):
     #if it is >=400 this line will raise an error.
     response.raise_for_status()
 
+    #what is this .json() -> convert the json response to python library
     return response.json()
 
 
@@ -129,17 +135,29 @@ def build_sparse_remote_cube():
 
     #if iline button is on then do this...
     if state.iline_check:
-        inline_slice = fetch_slice(state.iline_val, 0, 0, "inline")
+        # (new comment): Check cache before making a backend request for inline
+        if backend.cache["inline"]["val"] != state.iline_val or backend.cache["inline"]["data"] is None:
+            backend.cache["inline"]["data"] = fetch_slice(state.iline_val, 0, 0, "inline")
+            backend.cache["inline"]["val"] = state.iline_val
+        inline_slice = backend.cache["inline"]["data"]
         volume[state.iline_val, :, :] = inline_slice
         fetched_slices.append(inline_slice)
 
     if state.xline_check:
-        cross_slice = fetch_slice(0, state.xline_val, 0, "crossline")
+        # (new comment): Check cache before making a backend request for crossline
+        if backend.cache["crossline"]["val"] != state.xline_val or backend.cache["crossline"]["data"] is None:
+            backend.cache["crossline"]["data"] = fetch_slice(0, state.xline_val, 0, "crossline")
+            backend.cache["crossline"]["val"] = state.xline_val
+        cross_slice = backend.cache["crossline"]["data"]
         volume[:, state.xline_val, :] = cross_slice
         fetched_slices.append(cross_slice)
 
     if state.time_check:
-        time_slice = fetch_slice(0, 0, state.time_val, "time")
+        # (new comment): Check cache before making a backend request for time slice
+        if backend.cache["time"]["val"] != state.time_val or backend.cache["time"]["data"] is None:
+            backend.cache["time"]["data"] = fetch_slice(0, 0, state.time_val, "time")
+            backend.cache["time"]["val"] = state.time_val
+        time_slice = backend.cache["time"]["data"]
         volume[:, :, state.time_val] = time_slice
         fetched_slices.append(time_slice)
 
@@ -152,6 +170,8 @@ def build_sparse_remote_cube():
 
 #called from handle_viewer_upload function (at line 300)...
 def initialize_viewer(shape, loaded_path):
+    #what are backend variables..
+
     #storing the backend shape as a tuple
     backend.shape = tuple(shape)
     #telling the user the data is loaded and ready to view
@@ -299,9 +319,6 @@ def handle_viewer_upload(file_path=None):
         state.viewer_status_msg = "Run ML first so there is an output SEG-Y to visualize."
         return
 
-    #continue...
-    #flag for viewer_processing *dbt*
-    state.viewer_processing = True
     #shows user the message.
     state.viewer_status_msg = f"Connecting to {BACKEND_URL}..."
 
@@ -317,15 +334,14 @@ def handle_viewer_upload(file_path=None):
         update_slices()
     except Exception as err:
         state.viewer_status_msg = f"Viewer Error: {str(err)}"
-    finally:
-        state.viewer_processing = False
 
 #for any state change for mentioned variables invoke this function...
 #iline_val -> new inline value, iline_check -> inline switch state...
-@state.change("iline_val", "xline_val", "time_val", "iline_check", "xline_check", "time_check")
+# (new comment): Removed the *_val variables from observation so sliders don't trigger updates continuously
+@state.change("iline_check", "xline_check", "time_check")
 def update_slices(**kwargs):
     #**kwargs -> recieves info about what has changed...
-    #if backend.viewer_ready -> false data is not loaded yet so return...
+    #if backend.viewer_ready -> false data is not loaded yet so return...(dbt flag!)
     if not backend.viewer_ready:
         return
 
@@ -337,10 +353,6 @@ def update_slices(**kwargs):
         backend.window.Render()
         ctrl.view_update()
         return
-
-    #else if any one changes mark viewer as busy and it loads the new slice from
-    #backend...
-    state.viewer_processing = True
 
     try:
         #continue...
@@ -390,9 +402,6 @@ def update_slices(**kwargs):
     #error handling
     except Exception as err:
         state.viewer_status_msg = f"Viewer Error: {str(err)}"
-    finally:
-        #finally viewer_processing is done so the flag is set to false
-        state.viewer_processing = False
 
 
 # --- UI ---
@@ -579,24 +588,30 @@ with SinglePageLayout(server) as layout:
                                         vuetify.VSwitch(v_model=("iline_check",), color="#00d2ff", hide_details=True, inset=True, dense=True, dark=True)
                                     with vuetify.VCol():
                                         html.Span("Inline", classes="text-body-2 white--text")
+                                # (new comment): Attached 'change=update_slices' to only update on drag release
                                 vuetify.VSlider(v_if=("iline_check",), v_model=("iline_val",), min=0, max=("iline_max",), 
-                                                color="#00d2ff", track_color="grey darken-3", thumb_label=True, classes="mt-1 mb-4", dark=True)
+                                                color="#00d2ff", track_color="grey darken-3", thumb_label=True, classes="mt-1 mb-4", dark=True,
+                                                change=update_slices)
 
                                 with vuetify.VRow(align="center", classes="mb-0"):
                                     with vuetify.VCol(cols="auto"):
                                         vuetify.VSwitch(v_model=("xline_check",), color="#ff9800", hide_details=True, inset=True, dense=True, dark=True)
                                     with vuetify.VCol():
                                         html.Span("Crossline", classes="text-body-2 white--text")
+                                # (new comment): Attached 'change=update_slices' to only update on drag release
                                 vuetify.VSlider(v_if=("xline_check",), v_model=("xline_val",), min=0, max=("xline_max",), 
-                                                color="#ff9800", track_color="grey darken-3", thumb_label=True, classes="mt-1 mb-4", dark=True)
+                                                color="#ff9800", track_color="grey darken-3", thumb_label=True, classes="mt-1 mb-4", dark=True,
+                                                change=update_slices)
 
                                 with vuetify.VRow(align="center", classes="mb-0"):
                                     with vuetify.VCol(cols="auto"):
                                         vuetify.VSwitch(v_model=("time_check",), color="#b388ff", hide_details=True, inset=True, dense=True, dark=True)
                                     with vuetify.VCol():
                                         html.Span("Time Slice", classes="text-body-2 white--text")
+                                # (new comment): Attached 'change=update_slices' to only update on drag release
                                 vuetify.VSlider(v_if=("time_check",), v_model=("time_val",), min=0, max=("time_max",), 
-                                                color="#b388ff", track_color="grey darken-3", thumb_label=True, classes="mt-1", dark=True)
+                                                color="#b388ff", track_color="grey darken-3", thumb_label=True, classes="mt-1", dark=True,
+                                                change=update_slices)
 
                         #viewer panel for slices
                         with vuetify.VCol(cols="12", md="8", lg="9"):
@@ -626,5 +641,5 @@ with SinglePageLayout(server) as layout:
 if __name__ == "__main__":
     print("Starting Seismic Portal Pro on http://localhost:8081")
     print(f"Communicating with Backend Server at: {BACKEND_URL}")
-    server.start(port=8081)
-    #server.start(host="0.0.0.0", port=8081)
+    #server.start(port=8081)
+    server.start(host="0.0.0.0", port=8081)

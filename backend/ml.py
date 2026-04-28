@@ -1,10 +1,8 @@
-import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
-
 import numpy as np
 import segyio
 import tensorflow as tf
 from tensorflow.keras.models import model_from_json, Model
+import os
 import tempfile
 import uuid
 import time
@@ -12,23 +10,17 @@ import time
 # ---------------- SETTINGS ---------------- #
 PATCH_SIZE = 128
 OVERLAP = 12
-BATCH_SIZE = 1   # Increase to 16/32 if GPU allows
+BATCH_SIZE = 8   # Increase to 16/32 if GPU allows
 
-
-# ---------------- MODEL ---------------- #
 gpus = tf.config.list_physical_devices('GPU')
 if gpus:
     try:
-        for gpu in gpus:
-            tf.config.experimental.set_memory_growth(gpu, True)
-        print("GPUs detected:", gpus)
+        tf.config.experimental.set_memory_growth(gpus[0], True)
+        print("GPU detected:", gpus[0])
     except Exception as e:
         print("Could not set memory growth:", e)
-else:
-    print("Running on CPU")
 
-
-
+# ---------------- MODEL ---------------- #
 def load_model():
     print("[ML] Loading model...")
 

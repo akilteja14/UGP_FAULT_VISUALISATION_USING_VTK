@@ -293,21 +293,6 @@ def read_time_slice(slice_index):
 # -- Flask Endpoints: Volume Management --
 # =============================================================================
 
-@app.route("/status", methods=["GET"])
-def status():
-    """
-    Health-check endpoint. Reports whether a volume is currently indexed
-    and ready to be sliced, and what its dimensions are.
-
-    Returns:
-        JSON: { loaded: bool, path: str, shape: [int, int, int] or null }
-    """
-    with volume_lock:
-        return jsonify({
-            "loaded": loaded_path != "",
-            "path":   loaded_path,
-            "shape":  list(volume_shape) if volume_shape else None,
-        })
 
 #if load endpoint is triggered via a HTTP POST request run this function 
 @app.route("/load", methods=["POST"])
@@ -434,11 +419,26 @@ def upload_ml():
     file = request.files["file"]
     if file.filename == "":
         return jsonify({"error": "No file selected."}), 400
+    
+
 
     original_name = secure_filename(file.filename)
     ext = os.path.splitext(original_name)[1].lower()
     if ext not in [".segy", ".sgy"]:
         return jsonify({"error": "Only .segy and .sgy files are supported."}), 400
+
+    # Remove old uploaded SEG-Y files and their generated output SEG-Y files
+    if os.listdir(UPLOAD_DIR):
+        for old_name in os.listdir(UPLOAD_DIR):
+            if old_name.lower().endswith((".segy", ".sgy")):
+                old_upload_path = os.path.join(UPLOAD_DIR, old_name)
+                old_output_path = os.path.join(OUTPUT_DIR, f"faults_{old_name}")
+
+                if os.path.exists(old_upload_path):
+                    os.remove(old_upload_path)
+
+                if os.path.exists(old_output_path):
+                    os.remove(old_output_path)
 
     # Append a short UUID to prevent overwriting files with the same name
     stem       = os.path.splitext(original_name)[0]
