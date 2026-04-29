@@ -3,6 +3,7 @@ import sys
 import threading
 import uuid
 import asyncio
+import json
 from urllib.parse import quote
 import numpy as np
 import requests
@@ -17,8 +18,68 @@ from VTK_PY.segy_viewer import build_vtk_image, build_mapper, create_actors
 
 # --- Workspace Setup ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+TIMEOUT_CONFIG_PATH = os.path.join(BASE_DIR, "timeouts.json")
 # Default to localhost if backend is on the same machine, or override via environment variable
 BACKEND_URL = os.environ.get("BACKEND_URL", "http://localhost:5000")
+
+# These are fallback values. The main timeout values are stored in
+# frontend/timeouts.json so they can be increased/decreased without editing code.
+DEFAULT_TIMEOUTS = {
+    # Used when handle_viewer_upload asks backend /load to index a SEG-Y volume.
+    # This can take time for large files, so it is intentionally higher.
+    "load_volume_seconds": 300,
+
+    # Used by update_slices -> build_sparse_remote_cube -> fetch_slice.
+    # Slice extraction can be slow when backend reads from a big SEG-Y file.
+    "slice_fetch_seconds": 120,
+
+    # Used inside handle_viewer_upload when it checks /ml_status to find
+    # the latest generated SEG-Y output path.
+    "latest_ml_status_seconds": 20,
+
+    # Used when frontend proxies ML file upload to the backend.
+    "ml_upload_seconds": 300,
+
+    # Used when frontend asks backend to start ML execution.
+    "ml_run_start_seconds": 60,
+
+    # Used while frontend polls backend /ml_status during ML execution.
+    "ml_status_poll_seconds": 20,
+
+    # Used by the frontend /ml_status route when the HTML page asks status.
+    "frontend_ml_status_seconds": 20,
+}
+
+
+def load_timeout_config():
+    # Read timeout values from frontend/timeouts.json.
+    # If the JSON file is missing or invalid, the app still runs using defaults.
+    try:
+        with open(TIMEOUT_CONFIG_PATH, "r", encoding="utf-8") as config_file:
+            loaded_timeouts = json.load(config_file)
+    except (OSError, json.JSONDecodeError):
+        return DEFAULT_TIMEOUTS.copy()
+
+    # Start with defaults, then override only valid positive numeric values
+    # from JSON. This prevents a typo like "abc" or -1 from breaking requests.
+    timeouts = DEFAULT_TIMEOUTS.copy()
+    if not isinstance(loaded_timeouts, dict):
+        return timeouts
+
+    for key, value in loaded_timeouts.items():
+        if key in timeouts and isinstance(value, (int, float)) and value > 0:
+            timeouts[key] = value
+
+    return timeouts
+
+
+# Loaded once when main.py starts. Restart frontend after changing timeouts.json.
+REQUEST_TIMEOUTS = load_timeout_config()
+
+
+def request_timeout(name):
+    # Small helper so request calls clearly show which configured timeout is used.
+    return REQUEST_TIMEOUTS[name]
 
 # --- Server ---
 server = get_server(client_type="vue2")
@@ -49,6 +110,7 @@ class AppBackend:
         self.interactor.SetRenderWindow(self.window)
         self.interactor.SetInteractorStyle(vtk.vtkInteractorStyleTrackballCamera())
 
+#backend object
 backend = AppBackend()
 
 # --- State ---
@@ -92,7 +154,9 @@ def configure_slice_server(file_path):
     response = requests.post(
         f"{BACKEND_URL}/load",
         json={"path": file_path},
-        timeout=120,
+        # Timeout comes from JSON because loading/indexing a large SEG-Y file
+        # may take longer than the old hardcoded 120 seconds.
+        timeout=request_timeout("load_volume_seconds"),
     )
     #this recieves HTTP status and if it 200-299 then this is passed
     #if it is >=400 this line will raise an error.
@@ -113,7 +177,9 @@ def fetch_slice(inline_idx, crossline_idx, time_idx, mode):
             "time": time_idx,
             "mode": mode,
         },
-        timeout=30,
+        # Timeout comes from JSON because this function is called by
+        # update_slices and large slice reads can exceed the old 30 seconds.
+        timeout=request_timeout("slice_fetch_seconds"),
     )
 
     #continue...
@@ -208,7 +274,9 @@ async def upload_ml_file(request):
         resp = await asyncio.to_thread(
             requests.post, 
             f"{BACKEND_URL}/upload_ml", 
-            files={"file": (field.filename, data)}
+            files={"file": (field.filename, data)},
+            # Upload can be slow for large SEG-Y files, so keep it configurable.
+            timeout=request_timeout("ml_upload_seconds"),
         )
         resp.raise_for_status()
         return web.json_response(resp.json())
@@ -228,13 +296,26 @@ async def run_ml_file(request):
 
     try:
         # 1. Trigger the background job on backend
-        resp = await asyncio.to_thread(requests.post, f"{BACKEND_URL}/run_ml", json={"input_path": input_path})
+        resp = await asyncio.to_thread(
+            requests.post,
+            f"{BACKEND_URL}/run_ml",
+            json={"input_path": input_path},
+            # Starting the ML job should respond quickly, but this is still
+            # configurable in case the backend needs more setup time.
+            timeout=request_timeout("ml_run_start_seconds"),
+        )
         resp.raise_for_status()
         
         # 2. Poll backend status until complete or error
         while True:
             await asyncio.sleep(1.5)
-            status_resp = await asyncio.to_thread(requests.get, f"{BACKEND_URL}/ml_status")
+            status_resp = await asyncio.to_thread(
+                requests.get,
+                f"{BACKEND_URL}/ml_status",
+                # Each status check gets its own timeout from JSON.
+                # This is not the total ML runtime limit.
+                timeout=request_timeout("ml_status_poll_seconds"),
+            )
             if status_resp.status_code == 200:
                 data = status_resp.json()
                 if not data.get("running"):
@@ -262,7 +343,12 @@ async def run_ml_file(request):
 
 async def ml_status(request):
     try:
-        resp = await asyncio.to_thread(requests.get, f"{BACKEND_URL}/ml_status")
+        resp = await asyncio.to_thread(
+            requests.get,
+            f"{BACKEND_URL}/ml_status",
+            # Timeout for the frontend route that proxies ML status to HTML UI.
+            timeout=request_timeout("frontend_ml_status_seconds"),
+        )
         resp.raise_for_status()
         data = resp.json()
         
@@ -299,7 +385,12 @@ def handle_viewer_upload(file_path=None):
         try:
             #sending HTTP GET requests to Backend using requests library and
             #get's to know about the ML STATUS
-            resp = requests.get(f"{BACKEND_URL}/ml_status", timeout=5)
+            resp = requests.get(
+                f"{BACKEND_URL}/ml_status",
+                # Timeout comes from JSON. This is used when the viewer tries
+                # to discover the latest completed ML output path.
+                timeout=request_timeout("latest_ml_status_seconds"),
+            )
 
             #200 -> ok response
             if resp.status_code == 200:
@@ -311,6 +402,8 @@ def handle_viewer_upload(file_path=None):
                         state.ml_output_path = target_path
 
         except Exception:
+            #change3 -> we are using pass because if target_path is empty
+            #then we exception occurs and we show the next viewer_status_msg...
             pass
 
     #if we didn't get target_path after the get request then we should run the 
@@ -391,9 +484,11 @@ def update_slices(**kwargs):
 
         #shows the user a message about which inline, crossline and time slice
         #is being viewed
+
+        #change 1 : 28/04/26
         state.viewer_status_msg = (
-            f"Showing {state.viewer_loaded_name or 'volume'} "
-            f"I:{state.iline_val} X:{state.xline_val} T:{state.time_val}"
+            f"Showing "
+            f"Inline :{state.iline_val} Crossline:{state.xline_val} Time:{state.time_val}"
         )
 
         #just refreshes the screen

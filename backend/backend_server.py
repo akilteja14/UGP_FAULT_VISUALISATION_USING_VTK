@@ -27,6 +27,7 @@ MEMORY COMPARISON (before vs after this implementation):
 import os
 import threading
 import uuid
+import time
 
 import numpy as np
 import segyio
@@ -428,7 +429,7 @@ def upload_ml():
         return jsonify({"error": "Only .segy and .sgy files are supported."}), 400
 
     # Remove old uploaded SEG-Y files and their generated output SEG-Y files
-    if os.listdir(UPLOAD_DIR):
+    """if os.listdir(UPLOAD_DIR):
         for old_name in os.listdir(UPLOAD_DIR):
             if old_name.lower().endswith((".segy", ".sgy")):
                 old_upload_path = os.path.join(UPLOAD_DIR, old_name)
@@ -438,7 +439,7 @@ def upload_ml():
                     os.remove(old_upload_path)
 
                 if os.path.exists(old_output_path):
-                    os.remove(old_output_path)
+                    os.remove(old_output_path)"""
 
     # Append a short UUID to prevent overwriting files with the same name
     stem       = os.path.splitext(original_name)[0]
