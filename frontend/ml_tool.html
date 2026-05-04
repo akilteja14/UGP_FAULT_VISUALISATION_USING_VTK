@@ -38,7 +38,8 @@
       background: rgba(13, 17, 23, 0.45);
     }
 
-    input[type="file"] {
+    .file-upload-label {
+      display: block;
       width: 100%;
       box-sizing: border-box;
       color: #e2e8f0;
@@ -46,6 +47,18 @@
       border: 1px solid rgba(255,255,255,0.12);
       border-radius: 10px;
       padding: 12px;
+      cursor: pointer;
+      text-align: center;
+      font-weight: 500;
+      transition: background 0.2s;
+    }
+
+    .file-upload-label:hover {
+      background: rgba(255,255,255,0.08);
+    }
+
+    input[type="file"] {
+      display: none;
     }
 
     button, a.download {
@@ -107,6 +120,7 @@
 
     <div class="box">
       <input id="ml-upload-input" type="file" accept=".segy,.sgy">
+      <label for="ml-upload-input" class="file-upload-label">Upload File</label>
       <div id="ml-selected-name" class="filename">No file selected yet</div>
       <button id="ml-run-btn" disabled>Run Fault Extraction</button>
     </div>
@@ -134,6 +148,11 @@
       const downloadLink = document.getElementById("ml-download-link");
       const metaEl = document.getElementById("ml-meta");
       let progressTimer = null;
+
+      // Keep backend session alive by sending a heartbeat ping every 30 seconds
+      setInterval(() => {
+        fetch(`${window.location.origin}/ping_session`, { method: 'POST' }).catch(e => console.error(e));
+      }, 30000);
 
       function stopProgressPolling() {
         if (progressTimer) {
@@ -163,6 +182,16 @@
 
           if (!payload.running && (payload.stage === "complete" || payload.stage === "error")) {
             stopProgressPolling();
+            if (payload.stage === "complete") {
+              const filename = payload.output_path.split(/[\\/]/).pop();
+              outputPath.textContent = payload.output_path;
+              downloadLink.href = `${window.location.origin}/download/${filename}`;
+              outputWrap.style.display = "block";
+            }
+            runBtn.disabled = false;
+            input.disabled = false;
+            document.querySelector(".file-upload-label").style.pointerEvents = "auto";
+            document.querySelector(".file-upload-label").style.opacity = "1";
           }
         } catch (error) {
           console.error(error);
@@ -179,6 +208,9 @@
         outputWrap.style.display = "none";
         outputPath.textContent = "";
         runBtn.disabled = true;
+        input.disabled = true;
+        document.querySelector(".file-upload-label").style.pointerEvents = "none";
+        document.querySelector(".file-upload-label").style.opacity = "0.5";
 
         const formData = new FormData();
         formData.append("file", file);
@@ -219,6 +251,9 @@
           metaEl.textContent = "";
         } finally {
           event.target.value = "";
+          input.disabled = false;
+          document.querySelector(".file-upload-label").style.pointerEvents = "auto";
+          document.querySelector(".file-upload-label").style.opacity = "1";
         }
       });
 
@@ -229,13 +264,14 @@
         }
 
         runBtn.disabled = true;
+        input.disabled = true;
+        document.querySelector(".file-upload-label").style.pointerEvents = "none";
+        document.querySelector(".file-upload-label").style.opacity = "0.5";
         outputWrap.style.display = "none";
         outputPath.textContent = "";
         statusEl.textContent = "Running fault extraction...";
         metaEl.textContent = "";
         stopProgressPolling();
-        progressTimer = setInterval(refreshMlStatus, 1500);
-        refreshMlStatus();
 
         try {
           const response = await fetch(`${window.location.origin}/run_ml`, {
@@ -249,19 +285,26 @@
             statusEl.textContent = `Run failed: ${payload.error || "Unknown error"}`;
             stopProgressPolling();
             runBtn.disabled = false;
+            input.disabled = false;
+            document.querySelector(".file-upload-label").style.pointerEvents = "auto";
+            document.querySelector(".file-upload-label").style.opacity = "1";
             return;
           }
 
-          statusEl.textContent = "Process Finished. Success!";
-          outputPath.textContent = payload.output_path;
-          downloadLink.href = payload.download_url;
-          outputWrap.style.display = "block";
-          stopProgressPolling();
-          runBtn.disabled = false;
+          // Start polling for ML status now that the backend has successfully queued it
+          progressTimer = setInterval(refreshMlStatus, 1500);
+          refreshMlStatus();
+
+          // We do not stop polling or update UI to "Finished" here.
+          // The background process has started, and refreshMlStatus
+          // will handle displaying completion status and download links.
         } catch (error) {
           statusEl.textContent = `Run failed: ${error.message || "Unknown error"}`;
           stopProgressPolling();
           runBtn.disabled = false;
+          input.disabled = false;
+          document.querySelector(".file-upload-label").style.pointerEvents = "auto";
+          document.querySelector(".file-upload-label").style.opacity = "1";
         }
       });
     })();

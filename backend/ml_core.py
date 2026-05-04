@@ -94,19 +94,23 @@ def run_batch(model, patches, coords, output, weight, mask):
 # ---------------- MAIN ---------------- #
 def process_segy(input_path, output_path, model, progress_callback=None):
 
-    def report(stage, msg, pct=None):
-        if progress_callback:
-            progress_callback({"stage": stage, "message": msg, "percent": pct})
+    def report_progress(stage, message, percent=None, extra=None):
+        if progress_callback is not None:
+            payload = {"stage": stage, "message": message}
+            if percent is not None:
+                payload["percent"] = percent
+            if extra:
+                payload.update(extra)
+            progress_callback(payload)
 
     print("[ML] Reading SEG-Y...")
-    report("reading", "Reading SEG-Y...", 5)
+    report_progress("reading", "Reading SEG-Y...", 5)
 
     with segyio.open(input_path, "r", ignore_geometry=False) as src:
-        volume = segyio.tools.cube(src)
+        m1 = len(src.ilines)
+        m2 = len(src.xlines)
+        m3 = len(src.samples)
         spec = segyio.tools.metadata(src)
-
-    volume = volume.astype(np.float32)
-    m1, m2, m3 = volume.shape
 
     # ---------------- PATCH SETUP ---------------- #
     n, os_val = PATCH_SIZE, OVERLAP
@@ -122,6 +126,12 @@ def process_segy(input_path, output_path, model, progress_callback=None):
     total_patches = c1 * c2 * c3
 
     print(f"[ML] Total patches: {total_patches}")
+    report_progress(
+        "preparing",
+        f"Prepared {total_patches} inference patches.",
+        12,
+        {"total_patches": total_patches, "volume_shape": [int(m1), int(m2), int(m3)]},
+    )
 
     # ---------------- MEMMAP ---------------- #
     uid = uuid.uuid4().hex
@@ -130,7 +140,12 @@ def process_segy(input_path, output_path, model, progress_callback=None):
     wt_path = os.path.join(tempfile.gettempdir(), f"wt_{uid}.dat")
 
     padded = np.memmap(padded_path, dtype="float32", mode="w+", shape=(p1,p2,p3))
-    padded[:m1,:m2,:m3] = volume
+    
+    # Efficiently load data inline-by-inline directly into the memmap
+    # to avoid loading the entire cube into RAM at once.
+    with segyio.open(input_path, "r", ignore_geometry=False) as src:
+        for i, iline_no in enumerate(src.ilines):
+            padded[i, :m2, :m3] = src.iline[iline_no]
 
     output = np.memmap(out_path, dtype="float32", mode="w+", shape=(p1,p2,p3))
     weight = np.memmap(wt_path, dtype="float32", mode="w+", shape=(p1,p2,p3))
@@ -142,11 +157,13 @@ def process_segy(input_path, output_path, model, progress_callback=None):
 
     # ---------------- FAST INFERENCE ---------------- #
     print("[ML] Starting FAST GPU inference...")
-    report("inference", "Running inference...", 15)
+    
+    completed_patches = 0
+    progress_step = max(1, total_patches // 20)
+    start_time = time.time()
+    report_progress("inference", "Starting inference...", 15, {"total_patches": total_patches, "completed_patches": 0})
 
     patches, coords = [], []
-    completed = 0
-    start = time.time()
 
     for i in range(c1):
         for j in range(c2):
@@ -171,11 +188,32 @@ def process_segy(input_path, output_path, model, progress_callback=None):
                     run_batch(model, patches, coords, output, weight, mask)
                     patches, coords = [], []
 
-                completed += 1
+                completed_patches += 1
 
-                if completed % 100 == 0:
-                    elapsed = time.time() - start
-                    print(f"{completed}/{total_patches} | {elapsed:.1f}s")
+                if completed_patches == 1 or completed_patches % progress_step == 0 or completed_patches == total_patches:
+                    elapsed = time.time() - start_time
+                    rate = completed_patches / elapsed if elapsed > 0 else 0.0
+                    remaining = total_patches - completed_patches
+                    eta_seconds = remaining / rate if rate > 0 else 0.0
+                    percent = (completed_patches / total_patches) * 100
+                    overall_percent = 15 + percent * 0.75
+                    
+                    print(
+                        f"[ML] Progress: {completed_patches}/{total_patches} patches "
+                        f"({percent:.1f}%) | Elapsed: {elapsed:.1f}s | ETA: {eta_seconds:.1f}s"
+                    )
+                    
+                    report_progress(
+                        "inference",
+                        f"Inference {completed_patches}/{total_patches} patches ({percent:.1f}%)",
+                        overall_percent,
+                        {
+                            "completed_patches": completed_patches,
+                            "total_patches": total_patches,
+                            "elapsed_seconds": round(elapsed, 1),
+                            "eta_seconds": round(eta_seconds, 1),
+                        },
+                    )
 
     # leftover
     if patches:
@@ -183,10 +221,12 @@ def process_segy(input_path, output_path, model, progress_callback=None):
 
     # ---------------- FINALIZE ---------------- #
     print("[ML] Stitching...")
+    report_progress("stitching", "Stitching patches...", 90)
     result = output / (weight + 1e-8)
     result = result[:m1, :m2, :m3]
 
     print("[ML] Writing SEG-Y...")
+    report_progress("writing", "Finalizing and writing output SEG-Y...", 92)
 
     with segyio.open(input_path, "r") as src:
         with segyio.create(output_path, spec) as dst:
@@ -199,4 +239,5 @@ def process_segy(input_path, output_path, model, progress_callback=None):
                     dst.trace[idx] = result[i, j, :]
                     dst.header[idx] = src.header[idx]
 
-    print("✅ Done in {:.2f}s".format(time.time() - start))
+    print("✅ Done in {:.2f}s".format(time.time() - start_time))
+    report_progress("complete", "Process Complete.", 100, {"output_path": output_path})

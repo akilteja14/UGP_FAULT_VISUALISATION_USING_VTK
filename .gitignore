@@ -1,1 +1,33 @@
+# Model weights (large binary files)
 backend/model/pretrained_model.hdf5
+
+# Python virtual environment
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+.eggs/
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# OS / Editor artifacts
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# Build / dist
+dist/
+build/
+*.egg
+
+# Logs / temp
+*.log
+*.tmp

@@ -19,6 +19,7 @@ from VTK_PY.segy_viewer import build_vtk_image, build_mapper, create_actors
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # Default to localhost if backend is on the same machine, or override via environment variable
 BACKEND_URL = os.environ.get("BACKEND_URL", "http://localhost:5000")
+CLIENT_ID = str(uuid.uuid4())
 
 # --- Server ---
 server = get_server(client_type="vue2")
@@ -91,9 +92,13 @@ def configure_slice_server(file_path):
     #file_path is mostly the output segy file here
     response = requests.post(
         f"{BACKEND_URL}/load",
-        json={"path": file_path},
+        json={"path": file_path, "client_id": CLIENT_ID},
         timeout=120,
     )
+    
+    if response.status_code == 423:
+        raise Exception(response.json().get("error", "Server is busy."))
+        
     #this recieves HTTP status and if it 200-299 then this is passed
     #if it is >=400 this line will raise an error.
     response.raise_for_status()
@@ -207,7 +212,7 @@ async def upload_ml_file(request):
     try:
         resp = await asyncio.to_thread(
             requests.post, 
-            f"{BACKEND_URL}/upload_ml", 
+            f"{BACKEND_URL}/upload_ml?client_id={CLIENT_ID}", 
             files={"file": (field.filename, data)}
         )
         resp.raise_for_status()
@@ -228,34 +233,14 @@ async def run_ml_file(request):
 
     try:
         # 1. Trigger the background job on backend
-        resp = await asyncio.to_thread(requests.post, f"{BACKEND_URL}/run_ml", json={"input_path": input_path})
-        resp.raise_for_status()
+        resp = await asyncio.to_thread(requests.post, f"{BACKEND_URL}/run_ml", json={"input_path": input_path, "client_id": CLIENT_ID})
         
-        # 2. Poll backend status until complete or error
-        while True:
-            await asyncio.sleep(1.5)
-            status_resp = await asyncio.to_thread(requests.get, f"{BACKEND_URL}/ml_status")
-            if status_resp.status_code == 200:
-                data = status_resp.json()
-                if not data.get("running"):
-                    if data.get("stage") == "error":
-                        return web.json_response({"error": data.get("message")}, status=500)
-                    elif data.get("stage") == "complete":
-                        # Tell UI what the backend output path is
-
-                        #as ML model runs in the backend server we get the path 
-                        #to the output file in backend and we store that path in 
-                        #frontend here...
-                        output_path = data.get("output_path")
-                        with state:
-                            #state.ml_output_path store the path to output segy file
-                            state.ml_output_path = output_path
-                        return web.json_response({
-                            "output_path": output_path,
-                            # Provide a valid download URL if we implement proxy download,
-                            # for now, placeholder or point direct to backend if exposed
-                            "download_url": f"{BACKEND_URL}/download/{quote(os.path.basename(output_path))}" if output_path else ""
-                        })
+        if resp.status_code == 423:
+            return web.json_response(resp.json(), status=423)
+            
+        resp.raise_for_status()
+        return web.json_response(resp.json())
+        
     except Exception as e:
         return web.json_response({"error": str(e)}, status=500)
 
@@ -276,10 +261,28 @@ async def ml_status(request):
         return web.json_response({"error": str(e)}, status=500)
 
 
+async def cleanup_session(request):
+    try:
+        resp = await asyncio.to_thread(requests.post, f"{BACKEND_URL}/cleanup", json={"client_id": CLIENT_ID})
+        resp.raise_for_status()
+        return web.json_response(resp.json())
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
+
+async def ping_session(request):
+    try:
+        resp = await asyncio.to_thread(requests.post, f"{BACKEND_URL}/ping", json={"client_id": CLIENT_ID})
+        resp.raise_for_status()
+        return web.json_response(resp.json())
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
+
 def bind_server_routes(wslink_server):
     wslink_server.app.router.add_post("/upload_ml", upload_ml_file)
     wslink_server.app.router.add_post("/run_ml", run_ml_file)
     wslink_server.app.router.add_get("/ml_status", ml_status)
+    wslink_server.app.router.add_post("/cleanup_session", cleanup_session)
+    wslink_server.app.router.add_post("/ping_session", ping_session)
 
 ctrl.on_server_bind.add(bind_server_routes)
 
@@ -403,6 +406,38 @@ def update_slices(**kwargs):
     except Exception as err:
         state.viewer_status_msg = f"Viewer Error: {str(err)}"
 
+def cleanup_viewer():
+    """
+    Tells the backend to delete the currently loaded files for this client,
+    and clears the viewer and frontend state.
+    """
+    try:
+        requests.post(f"{BACKEND_URL}/cleanup", json={"client_id": CLIENT_ID}, timeout=5)
+    except Exception as err:
+        print(f"Cleanup error: {err}")
+        
+    # Remove actors
+    backend.renderer.RemoveAllViewProps()
+    backend.window.Render()
+    ctrl.view_update()
+    
+    # Reset internal state
+    backend.viewer_ready = False
+    backend.loaded_path = ""
+    backend.cache = {
+        "inline": {"val": None, "data": None},
+        "crossline": {"val": None, "data": None},
+        "time": {"val": None, "data": None},
+    }
+    
+    # Reset UI state
+    with state:
+        state.ml_output_path = ""
+        state.viewer_loaded_name = ""
+        state.viewer_status_msg = "Session cleaned. Free space recovered."
+        state.iline_check = False
+        state.xline_check = False
+        state.time_check = False
 
 # --- UI ---
 with SinglePageLayout(server) as layout:
@@ -410,6 +445,12 @@ with SinglePageLayout(server) as layout:
 
     # Content
     with layout.content:
+        html.Script(f"""
+            // Send a background heartbeat ping every 30 seconds
+            setInterval(function() {{
+                fetch('/ping_session', {{ method: 'POST' }}).catch(e => console.error(e));
+            }}, 30000);
+        """)
         html.Style("""
         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
 
@@ -575,6 +616,14 @@ with SinglePageLayout(server) as layout:
                                     rounded=True,
                                     class_="glow-btn mb-3",
                                     click=handle_viewer_upload,
+                                )
+                                
+                                vuetify.VBtn(
+                                    "Close Viewer & Clean Up Disk",
+                                    block=True,
+                                    rounded=True,
+                                    class_="glow-btn mb-3",
+                                    click=cleanup_viewer,
                                 )
 
                                 #slices buttons code

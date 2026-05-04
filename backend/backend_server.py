@@ -27,6 +27,7 @@ MEMORY COMPARISON (before vs after this implementation):
 import os
 import threading
 import uuid
+import time
 
 import numpy as np
 import segyio
@@ -44,6 +45,37 @@ app = Flask(__name__)
 # arriving at the same time) don't interfere with each other when reading
 # or updating the shared volume metadata below.
 volume_lock = threading.Lock()
+
+# =============================================================================
+# -- Global Server Lock --
+# =============================================================================
+server_lock_state = {
+    "is_busy": False,
+    "client_id": None,
+    "activity": ""
+}
+
+def try_acquire_lock(client_id, activity):
+    """Attempt to acquire the global server lock for a client."""
+    with volume_lock:
+        if not server_lock_state["is_busy"]:
+            server_lock_state["is_busy"] = True
+            server_lock_state["client_id"] = client_id
+            server_lock_state["activity"] = activity
+            return True
+        elif server_lock_state["client_id"] == client_id:
+            # Client already holds the lock, just update activity
+            server_lock_state["activity"] = activity
+            return True
+        return False
+
+def release_lock(client_id=None, force=False):
+    """Release the global server lock if held by the client."""
+    with volume_lock:
+        if force or (server_lock_state["is_busy"] and server_lock_state["client_id"] == client_id):
+            server_lock_state["is_busy"] = False
+            server_lock_state["client_id"] = None
+            server_lock_state["activity"] = ""
 
 # Path to the currently loaded SEG-Y file on disk.
 # Slices are read directly from this file on each request.
@@ -86,6 +118,9 @@ ml_job_status = {
     "eta_seconds":       0,
     "output_path":       "",
 }
+
+# client_id -> {"upload_path": "...", "output_path": "..."}
+client_files = {}
 
 
 # =============================================================================
@@ -314,11 +349,12 @@ def load():
 
     #silent = true -> invalid json no error but payload becomes none or {}
     payload   = request.get_json(silent=True) or {}
-    #strip removes trailing and leading whitespace (just for safety)
     file_path = (payload.get("path") or "").strip()
+    client_id = payload.get("client_id", "default_client")
 
-    #if file path is none we send an error json message and HTTP status code
-    #400 indicating it is an error to configure_slice_server function
+    if not try_acquire_lock(client_id, "viewing"):
+        return jsonify({"error": f"Server is busy ({server_lock_state['activity']} for another user). Please wait."}), 423
+
     if not file_path:
         return jsonify({"error": "Missing SEG-Y path."}), 400
 
@@ -413,6 +449,11 @@ def upload_ml():
     Returns:
         JSON: { saved_path: str, filename: str }
     """
+    client_id = request.args.get("client_id", request.form.get("client_id", "default_client"))
+
+    if not try_acquire_lock(client_id, "uploading"):
+        return jsonify({"error": f"Server is busy ({server_lock_state['activity']} for another user). Please wait."}), 423
+
     if "file" not in request.files:
         return jsonify({"error": "No file uploaded."}), 400
 
@@ -421,24 +462,23 @@ def upload_ml():
         return jsonify({"error": "No file selected."}), 400
     
 
-
     original_name = secure_filename(file.filename)
     ext = os.path.splitext(original_name)[1].lower()
     if ext not in [".segy", ".sgy"]:
         return jsonify({"error": "Only .segy and .sgy files are supported."}), 400
 
-    # Remove old uploaded SEG-Y files and their generated output SEG-Y files
-    if os.listdir(UPLOAD_DIR):
-        for old_name in os.listdir(UPLOAD_DIR):
-            if old_name.lower().endswith((".segy", ".sgy")):
-                old_upload_path = os.path.join(UPLOAD_DIR, old_name)
-                old_output_path = os.path.join(OUTPUT_DIR, f"faults_{old_name}")
-
-                if os.path.exists(old_upload_path):
-                    os.remove(old_upload_path)
-
-                if os.path.exists(old_output_path):
-                    os.remove(old_output_path)
+    # Clean up ONLY the previous files for this specific client
+    if client_id in client_files:
+        old_upload = client_files[client_id].get("upload_path")
+        old_output = client_files[client_id].get("output_path")
+        
+        if old_upload and os.path.exists(old_upload):
+            try: os.remove(old_upload)
+            except Exception: pass
+            
+        if old_output and os.path.exists(old_output):
+            try: os.remove(old_output)
+            except Exception: pass
 
     # Append a short UUID to prevent overwriting files with the same name
     stem       = os.path.splitext(original_name)[0]
@@ -446,6 +486,10 @@ def upload_ml():
     saved_path = os.path.join(UPLOAD_DIR, saved_name)
 
     file.save(saved_path)
+    
+    # Track the new upload for this client
+    client_files[client_id] = {"upload_path": saved_path, "output_path": "", "last_active": time.time()}
+    
     return jsonify({"saved_path": saved_path, "filename": saved_name})
 
 
@@ -464,11 +508,21 @@ def run_ml():
     """
     payload    = request.get_json(silent=True) or {}
     input_path = os.path.abspath((payload.get("input_path") or "").strip())
+    client_id  = payload.get("client_id", "default_client")
+
+    if not try_acquire_lock(client_id, "running ML"):
+        return jsonify({"error": f"Server is busy ({server_lock_state['activity']} for another user). Please wait."}), 423
 
     if not input_path or not os.path.exists(input_path):
         return jsonify({"error": "Missing or invalid input file path."}), 400
 
     output_path = processing.build_ml_output_path(input_path, OUTPUT_DIR)
+    
+    # Store output path in client's session
+    if client_id not in client_files:
+        client_files[client_id] = {"upload_path": input_path, "output_path": "", "last_active": time.time()}
+    client_files[client_id]["output_path"] = output_path
+    client_files[client_id]["last_active"] = time.time()
 
     def progress_callback(update):
         """
@@ -478,6 +532,11 @@ def run_ml():
         ml_job_status.update(update)
         # Mark as no longer running when the stage transitions to "complete"
         ml_job_status["running"] = update.get("stage") != "complete"
+        
+        # Keep the session alive while the ML job is running
+        if client_id in client_files:
+            client_files[client_id]["last_active"] = time.time()
+        client_activity[client_id] = time.time()
 
     def ml_worker():
         """
@@ -521,6 +580,59 @@ def run_ml():
     })
 
 
+@app.route("/ping", methods=["POST"])
+def ping_session():
+    """
+    Heartbeat ping from the frontend. Updates the last_active time for the client.
+    """
+    payload   = request.get_json(silent=True, force=True) or {}
+    client_id = payload.get("client_id", "default_client")
+
+    client_activity[client_id] = time.time()
+
+    if client_id in client_files:
+        client_files[client_id]["last_active"] = time.time()
+
+    return jsonify({"status": "ok"})
+
+
+@app.route("/cleanup", methods=["POST"])
+def cleanup():
+    """
+    Cleans up the currently loaded session files for a specific client.
+    """
+    global loaded_path, volume_shape, trace_map, unique_inlines, unique_crosslines
+    payload   = request.get_json(silent=True, force=True) or {}
+    client_id = payload.get("client_id", "default_client")
+
+    if client_id in client_files:
+        files = client_files[client_id]
+        old_upload = files.get("upload_path")
+        old_output = files.get("output_path")
+        
+        # Clear the global volume cache if we're deleting the currently loaded file
+        with volume_lock:
+            if loaded_path and (loaded_path == old_upload or loaded_path == old_output):
+                loaded_path = ""
+                volume_shape = None
+                trace_map = None
+                unique_inlines = None
+                unique_crosslines = None
+        
+        if old_upload and os.path.exists(old_upload):
+            try: os.remove(old_upload)
+            except Exception: pass
+            
+        if old_output and os.path.exists(old_output):
+            try: os.remove(old_output)
+            except Exception: pass
+            
+        del client_files[client_id]
+        release_lock(client_id)
+        
+    return jsonify({"message": "Cleanup successful."})
+
+
 @app.route("/ml_status", methods=["GET"])
 def get_ml_status():
     """
@@ -549,6 +661,67 @@ def download_file(filename):
     """
     return send_from_directory(OUTPUT_DIR, filename, as_attachment=True)
 
+
+# =============================================================================
+# -- Background Session Reaper --
+# =============================================================================
+
+TIMEOUT_SECONDS = 120  # 10 minutes
+
+def session_reaper():
+    """
+    Background thread that wakes up every 60 seconds and checks for inactive clients.
+    If a client hasn't sent a ping in TIMEOUT_SECONDS, their files are deleted.
+    """
+    global loaded_path, volume_shape, trace_map, unique_inlines, unique_crosslines
+    
+    while True:
+        time.sleep(60)
+        now = time.time()
+        expired_clients = []
+        
+        for client_id, files in list(client_files.items()):
+            # Use client_activity if available, otherwise fallback to files['last_active']
+            last_active = client_activity.get(client_id, files.get("last_active", now))
+            if now - last_active > TIMEOUT_SECONDS:
+                expired_clients.append(client_id)
+                
+        # Also check the lock holder in case they are visualizing but have no files in client_files
+        lock_holder = server_lock_state.get("client_id")
+        if lock_holder and lock_holder not in expired_clients:
+            if now - client_activity.get(lock_holder, now) > TIMEOUT_SECONDS:
+                expired_clients.append(lock_holder)
+
+        for client_id in expired_clients:
+            print(f"[REAPER] Client {client_id} timed out. Cleaning up...")
+            
+            # Remove from activity tracker
+            client_activity.pop(client_id, None)
+            
+            files = client_files.pop(client_id, {})
+            old_upload = files.get("upload_path")
+            old_output = files.get("output_path")
+            
+            with volume_lock:
+                if loaded_path and (loaded_path == old_upload or loaded_path == old_output):
+                    loaded_path = ""
+                    volume_shape = None
+                    trace_map = None
+                    unique_inlines = None
+                    unique_crosslines = None
+            
+            if old_upload and os.path.exists(old_upload):
+                try: os.remove(old_upload)
+                except Exception: pass
+                
+            if old_output and os.path.exists(old_output):
+                try: os.remove(old_output)
+                except Exception: pass
+                
+            release_lock(client_id)
+            print(f"[REAPER] Cleaned up inactive session for client {client_id}")
+
+threading.Thread(target=session_reaper, daemon=True).start()
 
 # =============================================================================
 # -- Entry Point --
