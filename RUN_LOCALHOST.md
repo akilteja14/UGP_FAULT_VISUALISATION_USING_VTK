@@ -18,8 +18,4 @@ cd UGP_FAULT_VISUALISATION_USING_VTK/frontend
 python main.py --server
 ```
 
-The user/client can open:
-
-```text
-http://REMOTE_SERVER_IP_ADDRESS:8081
-```
+The user/client can open: http://172.27.21.158:8081 in google and use this website

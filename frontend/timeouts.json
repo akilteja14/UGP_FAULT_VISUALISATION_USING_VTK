@@ -1,0 +1,9 @@
+{
+  "load_volume_seconds": 300,
+  "slice_fetch_seconds": 120,
+  "latest_ml_status_seconds": 20,
+  "ml_upload_seconds": 300,
+  "ml_run_start_seconds": 60,
+  "ml_status_poll_seconds": 20,
+  "frontend_ml_status_seconds": 20
+}
