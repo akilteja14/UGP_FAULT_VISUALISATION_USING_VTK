@@ -119,8 +119,12 @@ ml_job_status = {
     "output_path":       "",
 }
 
-# client_id -> {"upload_path": "...", "output_path": "..."}
+# client_id -> {"upload_path": "...", "output_path": "...", "last_active": float}
 client_files = {}
+
+# client_id -> last seen timestamp (float, from time.time())
+# Used by session_reaper and ping to track active clients separately from file state.
+client_activity = {}
 
 
 # =============================================================================
